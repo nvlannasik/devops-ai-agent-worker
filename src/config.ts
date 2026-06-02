@@ -1,0 +1,18 @@
+import "dotenv/config";
+
+export const config = {
+  sqs: {
+    region: process.env.AWS_REGION ?? "ap-southeast-1",
+    requestQueueName: process.env.SQS_REQUEST_QUEUE_NAME ?? "llm-request.fifo",
+    responseQueueName: process.env.SQS_RESPONSE_QUEUE_NAME ?? "llm-response.fifo",
+    requestDlqName: process.env.SQS_REQUEST_DLQ_NAME ?? "llm-request-dlq.fifo",
+    pollWaitSeconds: parseInt(process.env.SQS_POLL_WAIT_SECONDS ?? "10"),
+    maxMessages: parseInt(process.env.SQS_MAX_MESSAGES ?? "5"),
+  },
+  llm: {
+    baseUrl: process.env.LLM_BASE_URL!,
+    apiKey: process.env.LLM_API_KEY ?? "none",
+    model: process.env.LLM_MODEL!,
+    maxTokens: parseInt(process.env.LLM_MAX_TOKENS ?? "8096"),
+  },
+};
