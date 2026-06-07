@@ -14,5 +14,9 @@ export const config = {
     apiKey: process.env.LLM_API_KEY ?? "none",
     model: process.env.LLM_MODEL!,
     maxTokens: parseInt(process.env.LLM_MAX_TOKENS ?? "8096"),
+    useMaxCompletionTokens: process.env.LLM_USE_MAX_COMPLETION_TOKENS === "true",
+    temperature: process.env.LLM_TEMPERATURE ? parseFloat(process.env.LLM_TEMPERATURE) : undefined,
+    topP: process.env.LLM_TOP_P ? parseFloat(process.env.LLM_TOP_P) : undefined,
+    seed: process.env.LLM_SEED ? parseInt(process.env.LLM_SEED) : undefined,
   },
 };

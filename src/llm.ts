@@ -12,9 +12,17 @@ export async function callLLM(
   tools: ToolDefinition[],
   systemPrompt: string
 ): Promise<LLMResponse> {
+  const tokenParam = config.llm.useMaxCompletionTokens
+    ? { max_completion_tokens: config.llm.maxTokens }
+    : { max_tokens: config.llm.maxTokens };
+
   const response = await client.chat.completions.create({
     model: config.llm.model,
-    max_tokens: config.llm.maxTokens,
+    ...tokenParam,
+    ...(config.llm.temperature !== undefined && { temperature: config.llm.temperature }),
+    ...(config.llm.topP !== undefined && { top_p: config.llm.topP }),
+    ...(config.llm.seed !== undefined && { seed: config.llm.seed }),
+    stream: false,
     messages: [
       { role: "system", content: systemPrompt },
       ...messages.map((m) => ({
