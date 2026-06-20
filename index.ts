@@ -11,7 +11,9 @@ const shutdown = (signal: string) => {
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 
-startWorker(controller.signal).catch((err) => {
-  logger.error(`Worker fatal error: ${err}`);
-  process.exit(1);
-});
+startWorker(controller.signal)
+  .then(() => process.exit(0)) // graceful drain finished
+  .catch((err) => {
+    logger.error(`Worker fatal error: ${err}`);
+    process.exit(1);
+  });

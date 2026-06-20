@@ -31,7 +31,22 @@ cp env.example .env
 npm install
 npm run dev
 npm run build && npm start
+npm test                       # unit tests
 ```
+
+## Testing
+
+`npm test` runs `node --import tsx --test 'src/**/*.test.ts'` — Node's built-in test runner (Node >= 24), no extra dependencies. Test files (`*.test.ts`) are excluded from the production build. Current coverage: `parseSqsRequest` (poison-pill / malformed-message validation).
+
+## Reliability
+
+| Behavior | Details |
+|----------|---------|
+| Continuous polling | Messages processed as independent in-flight tasks (up to `SQS_MAX_CONCURRENCY`) — a slow LLM call never blocks pickup of other requests |
+| Graceful drain | On `SIGTERM`/`SIGINT`, in-flight LLM calls finish and publish their responses before exit |
+| Poison-pill guard | Unparseable / missing-`requestId` messages go straight to the DLQ instead of being redelivered forever |
+| RedrivePolicy | Best-effort backstop: SQS dead-letters a message after `SQS_MAX_RECEIVE_COUNT` receives (skipped with a warning if IAM is missing) |
+| Request timeouts | SQS client `connectionTimeout`/`requestTimeout` so a hung call can't freeze the poll loop |
 
 ## Configuration
 
@@ -43,6 +58,9 @@ npm run build && npm start
 | `SQS_REQUEST_DLQ_NAME` | FIFO dead-letter queue | `llm-request-dlq.fifo` |
 | `SQS_POLL_WAIT_SECONDS` | Long-poll wait (max 20) | `10` |
 | `SQS_MAX_MESSAGES` | Max messages per poll | `5` |
+| `SQS_MAX_CONCURRENCY` | Max messages processed concurrently (poll loop never blocks on a slow LLM call) | `10` |
+| `SQS_VISIBILITY_TIMEOUT_SECONDS` | Request queue visibility timeout — must exceed max LLM inference time | `300` |
+| `SQS_MAX_RECEIVE_COUNT` | Receives before SQS moves a message to the DLQ (RedrivePolicy) | `3` |
 | `LLM_BASE_URL` | Private LLM base URL | required |
 | `LLM_API_KEY` | API key (`none` if not needed) | `none` |
 | `LLM_MODEL` | Model name | required |

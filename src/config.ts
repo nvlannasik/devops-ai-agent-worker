@@ -8,6 +8,12 @@ export const config = {
     requestDlqName: process.env.SQS_REQUEST_DLQ_NAME ?? "llm-request-dlq.fifo",
     pollWaitSeconds: parseInt(process.env.SQS_POLL_WAIT_SECONDS ?? "10"),
     maxMessages: parseInt(process.env.SQS_MAX_MESSAGES ?? "5"),
+    // max messages processed concurrently — the poll loop keeps pulling new work up
+    // to this cap so one slow LLM call can't block pickup of other requests
+    maxConcurrency: parseInt(process.env.SQS_MAX_CONCURRENCY ?? "10"),
+    visibilityTimeoutSeconds: parseInt(process.env.SQS_VISIBILITY_TIMEOUT_SECONDS ?? "300"),
+    // after this many receives without a successful delete, SQS moves the message to the DLQ itself
+    maxReceiveCount: parseInt(process.env.SQS_MAX_RECEIVE_COUNT ?? "3"),
   },
   llm: {
     baseUrl: process.env.LLM_BASE_URL!,
