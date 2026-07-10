@@ -15,18 +15,17 @@ RUN npm run build
 FROM alpine:3.20 AS aws-tools
 
 ARG TARGETARCH
-ARG SIGNING_HELPER_VERSION=1.1.1
+ARG SIGNING_HELPER_VERSION=1.8.4
 
 RUN apk add --no-cache curl && \
     case "$TARGETARCH" in \
       amd64) ARCH="X86_64" ;; \
-      arm64) ARCH="ARM64"  ;; \
+      arm64) ARCH="Aarch64" ;; \
       *)     echo "Unsupported arch: $TARGETARCH" && exit 1 ;; \
     esac && \
     curl -fLo /aws_signing_helper \
-      "https://rolesanywhere.amazonaws.com/releases/${SIGNING_HELPER_VERSION}/${ARCH}/Linux/aws_signing_helper" && \
+      "https://rolesanywhere.amazonaws.com/releases/${SIGNING_HELPER_VERSION}/${ARCH}/Linux/Amzn2023/aws_signing_helper" && \
     chmod +x /aws_signing_helper
-
 
 FROM node:24-alpine AS runtime
 
