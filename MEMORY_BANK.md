@@ -47,6 +47,15 @@ Prevents "Unsupported parameter" errors from models that don't support `top_p`, 
 | `LLM_TEMPERATURE` | Optional — omit if unsupported |
 | `LLM_TOP_P` | Optional — omit if unsupported |
 | `LLM_SEED` | Optional — omit if unsupported |
+| `LLM_REASONING_EFFORT` | Optional — forwarded as `reasoning_effort` (low/medium/high); caps hidden thinking tokens |
+
+The `tools` param is **omitted entirely when the agent sends an empty tools array** (tool
+budget reached) — some OpenAI-compatible backends reject `tools: []`.
+
+### Reasoning-model handling (`llm.ts`)
+- `finish_reason: "length"` → mapped to `max_tokens` (was disguised as `end_turn`), so truncation is visible end-to-end.
+- **Auto-retry safeguard:** `isEmptyTokenExhaustion()` (unit-tested) — empty content + `max_tokens` means the model spent the ENTIRE budget on hidden thinking; retry once with **2× the token budget**. Partial answers are never retried; one retry max. Frequent `warn` retries = raise `LLM_MAX_TOKENS` (16384 recommended for reasoning models; thinking counts toward the limit).
+- Agent-side `SQS_LLM_TIMEOUT_SECONDS` must cover attempt + retry (agent default now 240s — 120s once lost the race by 23s).
 
 ### DLQ Flow
 On LLM error:

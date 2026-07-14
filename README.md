@@ -64,8 +64,9 @@ npm test                       # unit tests
 | `LLM_BASE_URL` | Private LLM base URL | required |
 | `LLM_API_KEY` | API key (`none` if not needed) | `none` |
 | `LLM_MODEL` | Model name | required |
-| `LLM_MAX_TOKENS` | Max output tokens | `8096` |
+| `LLM_MAX_TOKENS` | Max output tokens. **Reasoning models:** hidden thinking counts toward this — use `16384`+ so thinking + answer fit | `8096` |
 | `LLM_USE_MAX_COMPLETION_TOKENS` | Use `max_completion_tokens` instead of `max_tokens` | `false` |
+| `LLM_REASONING_EFFORT` | Optional — forwarded as `reasoning_effort` (`low`/`medium`/`high`) to cap hidden thinking tokens. Leave unset if the backend rejects it | — |
 | `LLM_TEMPERATURE` | Optional — omit if model doesn't support it | — |
 | `LLM_TOP_P` | Optional — omit if model doesn't support it | — |
 | `LLM_SEED` | Optional — omit if model doesn't support it | — |
@@ -74,6 +75,12 @@ npm test                       # unit tests
 | `AWS_SECRET_ACCESS_KEY` | Local dev only — use IRSA in production | — |
 
 Queues are **auto-created** if they don't exist (FIFO detected from `.fifo` suffix).
+
+## Reasoning-Model Handling
+
+- `finish_reason: "length"` is surfaced to the agent as `max_tokens` (not disguised as a clean `end_turn`), so truncation is visible in both worker and agent logs.
+- **Auto-retry safeguard:** if a response is cut off by the token limit with **no content at all** (a reasoning model spent the whole budget thinking), the worker retries once with **2× the token budget**. Partial answers are never retried. A `warn` log marks each retry — frequent retries mean `LLM_MAX_TOKENS` is too small.
+- The agent's `SQS_LLM_TIMEOUT_SECONDS` must cover a slow call plus this retry (default there is `240`).
 
 ## Common Model Compatibility Issues
 

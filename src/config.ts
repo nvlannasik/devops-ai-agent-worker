@@ -21,6 +21,10 @@ export const config = {
     model: process.env.LLM_MODEL!,
     maxTokens: parseInt(process.env.LLM_MAX_TOKENS ?? "8096"),
     useMaxCompletionTokens: process.env.LLM_USE_MAX_COMPLETION_TOKENS === "true",
+    // optional: forwarded as reasoning_effort ("low" | "medium" | "high") for reasoning
+    // models — caps hidden thinking tokens so they can't eat the whole output budget.
+    // Leave unset if the backend doesn't accept the param.
+    reasoningEffort: process.env.LLM_REASONING_EFFORT as "low" | "medium" | "high" | undefined,
     temperature: process.env.LLM_TEMPERATURE ? parseFloat(process.env.LLM_TEMPERATURE) : undefined,
     topP: process.env.LLM_TOP_P ? parseFloat(process.env.LLM_TOP_P) : undefined,
     seed: process.env.LLM_SEED ? parseInt(process.env.LLM_SEED) : undefined,
