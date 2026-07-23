@@ -1,4 +1,13 @@
 import "dotenv/config";
+import { readFileSync } from "node:fs";
+
+// GitHub App private key: inline PEM (GITHUB_APP_PRIVATE_KEY) or a mounted file
+// (GITHUB_APP_PRIVATE_KEY_FILE, e.g. a K8s secret). Read once at startup.
+function readGithubPrivateKey(): string {
+  const file = process.env.GITHUB_APP_PRIVATE_KEY_FILE;
+  if (file) return readFileSync(file, "utf8");
+  return process.env.GITHUB_APP_PRIVATE_KEY ?? "";
+}
 
 export const config = {
   sqs: {
@@ -18,6 +27,12 @@ export const config = {
   llm: {
     baseUrl: process.env.LLM_BASE_URL!,
     apiKey: process.env.LLM_API_KEY ?? "none",
+    // Optional SOCKS proxy for the LLM API only (e.g. socks5://127.0.0.1:1080). Node's
+    // fetch/undici has no SOCKS support and ignores ALL_PROXY, so a tunnel that curl reaches
+    // via SOCKS is invisible to the worker without this. Unset = direct connection (no code
+    // path change) — remove the env once the host is whitelisted. Scoped to the LLM client,
+    // NOT global, so the GitOps GitHub calls aren't forced through it.
+    socksProxy: process.env.LLM_SOCKS_PROXY ?? "",
     model: process.env.LLM_MODEL!,
     maxTokens: parseInt(process.env.LLM_MAX_TOKENS ?? "8096"),
     useMaxCompletionTokens: process.env.LLM_USE_MAX_COMPLETION_TOKENS === "true",
@@ -28,5 +43,23 @@ export const config = {
     temperature: process.env.LLM_TEMPERATURE ? parseFloat(process.env.LLM_TEMPERATURE) : undefined,
     topP: process.env.LLM_TOP_P ? parseFloat(process.env.LLM_TOP_P) : undefined,
     seed: process.env.LLM_SEED ? parseInt(process.env.LLM_SEED) : undefined,
+  },
+  // GitOps PR-flow (DESIGN_gitops_pr_remediation.md). The worker is the private-network
+  // bridge; GitHub Enterprise is reachable only from here. `enabled` gates the second SQS
+  // handler (Step 3) — off unless a GitHub App + repo are configured.
+  gitops: {
+    // enabled by EITHER a PAT (simple, initial-phase) OR a GitHub App, plus a repo.
+    enabled: !!((process.env.GITHUB_TOKEN || process.env.GITHUB_APP_ID) && process.env.GITOPS_REPO),
+    apiUrl: process.env.GITHUB_API_URL ?? "https://api.github.com", // GHE: https://<host>/api/v3
+    // PAT — used directly as the bearer when set; takes precedence over the App flow.
+    token: process.env.GITHUB_TOKEN ?? "",
+    // GitHub App flow (used when no PAT): appId + installationId + private key → installation token.
+    appId: process.env.GITHUB_APP_ID ?? "",
+    installationId: process.env.GITHUB_APP_INSTALLATION_ID ?? "",
+    privateKey: readGithubPrivateKey(),
+    repo: process.env.GITOPS_REPO ?? "", // owner/repo — the ONLY repo the handler may touch
+    branch: process.env.GITOPS_BRANCH ?? "main",
+    pathPrefix: process.env.GITOPS_PATH_PREFIX ?? "", // optional search-scope subtree
+    requestQueueName: process.env.SQS_GITOPS_REQUEST_QUEUE_NAME ?? "gitops-request.fifo",
   },
 };

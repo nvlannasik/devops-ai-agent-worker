@@ -12,6 +12,9 @@ import { parseSqsRequest } from "./message.js";
 import { callLLM } from "./llm.js";
 import logger from "./logger.js";
 import type { SQSResponse } from "./types.js";
+import { parseGitOpsRequest, type GitOpsResponse } from "./gitops/message.js";
+import { runGitOps, githubBackend } from "./gitops/handler.js";
+import { GitHubClient } from "./gitops/github-client.js";
 
 const sqs = new SQSClient({
   region: config.sqs.region,
@@ -150,55 +153,101 @@ async function processMessage(body: string, receiptHandle: string, queues: Queue
   logger.info(`Replied requestId=${req.requestId} (${response.error ? "error" : "ok"})`);
 }
 
-export async function startWorker(signal: AbortSignal): Promise<void> {
-  const queues = await resolveQueues();
-  const maxConcurrency = config.sqs.maxConcurrency;
-  logger.info(`Worker started — polling ${config.sqs.requestQueueName} (max concurrency ${maxConcurrency})`);
+// GitOps PR-flow message: parse → run the op → publish the result on the SHARED response
+// queue routed by requestId. Fast (no long LLM call), so no visibility extender. Business
+// refusals travel in `response` (payload.ok=false); only exceptions use the envelope `error`.
+async function processGitOpsMessage(body: string, receiptHandle: string, queueUrl: string, responseUrl: string, backend: ReturnType<typeof githubBackend>): Promise<void> {
+  const req = parseGitOpsRequest(body);
+  if (!req) {
+    logger.error("Malformed gitops message (unparseable / missing fields) — dropping");
+    await sqs.send(new DeleteMessageCommand({ QueueUrl: queueUrl, ReceiptHandle: receiptHandle }));
+    return;
+  }
+  logger.info(`GitOps ${req.op} requestId=${req.requestId} (${req.action} ${req.helmRelease.namespace}/${req.helmRelease.name})`);
 
-  // Process messages as independent in-flight tasks instead of awaiting a whole
-  // batch. A slow LLM call holds one slot but never blocks the loop from pulling
-  // and starting other requests — the previous `await Promise.all(batch)` stalled
-  // pickup for as long as the slowest message in the batch took.
+  let response: GitOpsResponse;
+  try {
+    response = { requestId: req.requestId, response: await runGitOps(req, backend) };
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    logger.error(`GitOps error requestId=${req.requestId}: ${error}`);
+    response = { requestId: req.requestId, error };
+  }
+
+  await Promise.all([
+    sqs.send(new SendMessageCommand({ QueueUrl: responseUrl, MessageBody: JSON.stringify(response), MessageGroupId: req.requestId, MessageDeduplicationId: req.requestId })),
+    sqs.send(new DeleteMessageCommand({ QueueUrl: queueUrl, ReceiptHandle: receiptHandle })),
+  ]);
+  logger.info(`GitOps replied requestId=${req.requestId} (${response.error ? "error" : "ok"})`);
+}
+
+// Generic receive/dispatch/drain loop, shared by the LLM and GitOps queues. `handle` owns
+// everything per message (parse, process, publish, delete) — this only manages polling,
+// the concurrency cap, in-flight bookkeeping, and the graceful drain.
+async function pollLoop(
+  signal: AbortSignal,
+  queueUrl: string,
+  label: string,
+  maxConcurrency: number,
+  handle: (body: string, receiptHandle: string) => Promise<void>
+): Promise<void> {
+  logger.info(`Polling ${label} (max concurrency ${maxConcurrency})`);
   const inFlight = new Set<Promise<void>>();
 
   while (!signal.aborted) {
-    // no free slot — wait for one to open before polling for more work
     if (inFlight.size >= maxConcurrency) {
       await Promise.race(inFlight);
       continue;
     }
-
     try {
       const result = await sqs.send(
         new ReceiveMessageCommand({
-          QueueUrl: queues.request,
+          QueueUrl: queueUrl,
           MaxNumberOfMessages: Math.min(config.sqs.maxMessages, maxConcurrency - inFlight.size, 10), // SQS hard cap is 10
           WaitTimeSeconds: config.sqs.pollWaitSeconds,
         }),
-        { abortSignal: signal },
+        { abortSignal: signal }
       );
-
       const messages = result.Messages ?? [];
       if (messages.length === 0) continue;
 
-      logger.debug(`Received ${messages.length} message(s) (in-flight ${inFlight.size})`);
+      logger.debug(`[${label}] received ${messages.length} message(s) (in-flight ${inFlight.size})`);
       for (const msg of messages) {
-        const task = processMessage(msg.Body!, msg.ReceiptHandle!, queues)
-          .catch((err) => { logger.error(`processMessage failed: ${err instanceof Error ? err.message : err}`); })
+        const task = handle(msg.Body!, msg.ReceiptHandle!)
+          .catch((err) => { logger.error(`[${label}] handler failed: ${err instanceof Error ? err.message : err}`); })
           .finally(() => inFlight.delete(task));
         inFlight.add(task);
       }
     } catch (err) {
       if (signal.aborted) break;
-      logger.error(`Poll error: ${err} — retrying in 5s`);
+      logger.error(`[${label}] poll error: ${err} — retrying in 5s`);
       await new Promise((r) => setTimeout(r, 5000));
     }
   }
 
-  // graceful drain — let in-flight LLM calls finish and publish their responses
   if (inFlight.size > 0) {
-    logger.info(`Draining ${inFlight.size} in-flight message(s) before shutdown...`);
+    logger.info(`Draining ${inFlight.size} in-flight ${label} message(s) before shutdown...`);
     await Promise.allSettled(inFlight);
   }
+}
+
+export async function startWorker(signal: AbortSignal): Promise<void> {
+  const queues = await resolveQueues();
+  const maxConcurrency = config.sqs.maxConcurrency;
+
+  const loops: Promise<void>[] = [
+    pollLoop(signal, queues.request, config.sqs.requestQueueName, maxConcurrency, (body, rh) => processMessage(body, rh, queues)),
+  ];
+
+  // Second consumer for the GitOps PR-flow (DESIGN_gitops_pr_remediation.md), only when a
+  // GitHub App + repo are configured. Replies on the SAME response queue, routed by requestId.
+  if (config.gitops.enabled) {
+    const gitopsQueue = await resolveQueueUrl(sqs, config.gitops.requestQueueName, config.sqs.visibilityTimeoutSeconds);
+    logger.info(`GitOps PR-flow enabled — repo ${config.gitops.repo} via ${config.gitops.apiUrl}`);
+    const backend = githubBackend(new GitHubClient(config.gitops), { branch: config.gitops.branch, pathPrefix: config.gitops.pathPrefix });
+    loops.push(pollLoop(signal, gitopsQueue, config.gitops.requestQueueName, maxConcurrency, (body, rh) => processGitOpsMessage(body, rh, gitopsQueue, queues.response, backend)));
+  }
+
+  await Promise.all(loops);
   logger.info("Worker stopped");
 }

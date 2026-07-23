@@ -52,6 +52,24 @@ Prevents "Unsupported parameter" errors from models that don't support `top_p`, 
 The `tools` param is **omitted entirely when the agent sends an empty tools array** (tool
 budget reached) — some OpenAI-compatible backends reject `tools: []`.
 
+### SOCKS proxy for the LLM API (`LLM_SOCKS_PROXY`, `llm.ts`)
+Optional — for hosts that reach the LLM API only through a SOCKS tunnel (`ssh -D`). Node's
+`fetch`/undici has **no SOCKS support** and ignores `ALL_PROXY`, so without this the worker
+connects directly and times out (curl works, Node doesn't — classic symptom).
+- `buildSocksFetch(proxy)` builds a custom `fetch` from **undici's OWN `fetch` + `Agent` +
+  `fetch-socks` `socksConnector`** — NOT Node's global fetch. Mixing `fetch-socks`'s
+  `socksDispatcher` (its bundled undici Agent) with Node's internal fetch fails
+  `UND_ERR_INVALID_ARG: invalid onRequestStart method` — the dispatcher and the fetch that
+  runs it must come from the SAME undici (handler interfaces diverge across versions). This
+  bug was caught by a live loopback-SOCKS integration test (`socks.test.ts`) — keep it.
+- Scoped to the OpenAI client's `fetch` only (NOT `setGlobalDispatcher`) so the GitOps
+  GitHub calls in the same process aren't forced through the LLM tunnel.
+- `parseSocksProxy` (exported, tested) parses `socks5://[user:pass@]host:port` (socks4/5).
+  Unset → plain client, zero behavior change (remove the env once whitelisted).
+- New deps: `undici` (its fetch/Agent) + `fetch-socks` (the socks connector) + `socks`.
+- Container gotcha: `127.0.0.1` in a container ≠ the host running the tunnel — use host
+  networking or `host.docker.internal` (see README).
+
 ### Reasoning-model handling (`llm.ts`)
 - `finish_reason: "length"` → mapped to `max_tokens` (was disguised as `end_turn`), so truncation is visible end-to-end.
 - **Auto-retry safeguard:** `isEmptyTokenExhaustion()` (unit-tested) — empty content + `max_tokens` means the model spent the ENTIRE budget on hidden thinking; retry once with **2× the token budget**. Partial answers are never retried; one retry max. Frequent `warn` retries = raise `LLM_MAX_TOKENS` (16384 recommended for reasoning models; thinking counts toward the limit).
@@ -87,6 +105,18 @@ On LLM error:
 ### Graceful Shutdown
 - `AbortController` signal → loop breaks, then `await Promise.allSettled(inFlight)` **drains** remaining in-flight LLM calls so their responses are still published (agents aren't left waiting).
 - `index.ts` calls `process.exit(0)` once `startWorker` resolves (after drain).
+
+### GitOps PR-flow bridge (`src/gitops/`, DESIGN_gitops_pr_remediation.md)
+The worker is ALSO the private-network bridge to **GitHub Enterprise** (reachable only from
+here, like the private LLM). Step 2 shipped the building blocks (no live SQS handler yet — that's Step 3):
+- **Auth — PAT or GitHub App.** `GITHUB_TOKEN` (PAT) is used directly as the bearer and **takes precedence** (simple, chosen for the initial phase — GitHub App registration was access-limited on the target GHE). Without a PAT, the App flow runs. `config.gitops.enabled` = `(GITHUB_TOKEN || GITHUB_APP_ID) && GITOPS_REPO`.
+- **`github-app.ts`** — GitHub App auth hand-rolled with `node:crypto` (no `@octokit` dep): `buildAppJwt` (RS256 JWT, iss=appId, exp ≤10min) → `getInstallationToken` (exchange for a ≤1h token). Unit-tested with a real generated keypair (sign + verify). Unused when a PAT is set.
+- **`github-client.ts`** — thin REST client over `fetch` (configurable `apiUrl` for GHE): `listYamlFiles` (recursive tree), `getFile`, `createBranch`, `putFile` (contents API — no clone), `openPr`. `token()` returns the PAT directly when set, else the cached App installation token (~1min-before-expiry refresh). `fetch` injectable for tests (PAT path unit-tested: skips the App exchange).
+- **`resolve.ts`** — locate + edit, **line-based, NO yaml dependency** (targeted one-line edit → minimal diff, comments preserved; a parse+reserialize would rewrite the whole file). `resolveGitOpsEdit(files, helmRelease, changeSpec)`: find the HelmRelease file (`kind: HelmRelease` + matching `name:`), find the single value line (`tag`/`image` for set_image via `tagOf`; `replicaCount`/`replicas` for scale), replace it, return `{path, valuesKey, before, after, newContent, diff}`. Refuses (honest) on: HR file missing/ambiguous, value not inline (overlay/chart-default), or >1 matching line. **`set_resources` is deferred** (needs structured nested-YAML navigation) — `// ponytail:` revisit with the `yaml` Document API when needed.
+- Config: `config.gitops` (enabled when `GITHUB_APP_ID` + `GITOPS_REPO` set); private key from `GITHUB_APP_PRIVATE_KEY` or `_FILE`.
+- **`message.ts`** — SQS contract (agent → worker): `{requestId, op:"dry_run"|"open_pr", helmRelease:{name,namespace}, action, container?, changes:[{field,from,to}], pathPrefix?, incident?}` → `{requestId, response: GitOpsPayload | error}`. `repo`/`branch` are NOT in the message (worker owns them = single-repo blast radius). `pathPrefix` IS in the message — the agent auto-detects the per-env overlay from the Flux Kustomization `spec.path` and sends it; `listCandidateFiles(pathPrefix ?? config.pathPrefix)` scopes the file search to it (falls back to `GITOPS_PATH_PREFIX`). `parseGitOpsRequest` validates (trust boundary), unit-tested.
+- **`handler.ts`** — `runGitOps(req, backend)`: locate+resolve → dry_run returns the diff, open_pr re-reads the sha (catches drift), branches, commits the one file, opens the PR. GitHub side behind a `GitOpsBackend` interface (unit-tested with a fake). `githubBackend` narrows to release-like YAML (`mapLimit` bounded fetch) then falls back to all. `prTitle`/`prBody` (exported, tested) build a short action-specific title (`Remediation: bump \`x\` image to v2`) + a clean body (workload/file, change table, collapsible diff, provenance) from the structured change — NOT the agent's verbose card summary.
+- **Worker wiring (`worker.ts`):** the receive/concurrency/drain loop was extracted into a generic `pollLoop(signal, queueUrl, label, maxConcurrency, handle)`; `startWorker` runs it for the LLM queue and — when `config.gitops.enabled` — a second loop on the `gitops` queue. `processGitOpsMessage` publishes on the **shared response queue** routed by `requestId` (agent's gitops client routes it, Step 4). Business refusals travel in `response.ok=false`; only exceptions use the envelope `error`. **The LLM `processMessage` is unchanged.**
 
 ## Configuration
 

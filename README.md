@@ -63,6 +63,7 @@ npm test                       # unit tests
 | `SQS_MAX_RECEIVE_COUNT` | Receives before SQS moves a message to the DLQ (RedrivePolicy) | `3` |
 | `LLM_BASE_URL` | Private LLM base URL | required |
 | `LLM_API_KEY` | API key (`none` if not needed) | `none` |
+| `LLM_SOCKS_PROXY` | Optional SOCKS proxy for the LLM API only, e.g. `socks5://127.0.0.1:1080`. Unset = direct connection. See **SOCKS proxy** below | — |
 | `LLM_MODEL` | Model name | required |
 | `LLM_MAX_TOKENS` | Max output tokens. **Reasoning models:** hidden thinking counts toward this — use `16384`+ so thinking + answer fit | `8096` |
 | `LLM_USE_MAX_COMPLETION_TOKENS` | Use `max_completion_tokens` instead of `max_tokens` | `false` |
@@ -75,6 +76,49 @@ npm test                       # unit tests
 | `AWS_SECRET_ACCESS_KEY` | Local dev only — use IRSA in production | — |
 
 Queues are **auto-created** if they don't exist (FIFO detected from `.fifo` suffix).
+
+### SOCKS proxy (`LLM_SOCKS_PROXY`)
+
+When the worker's host can only reach the LLM API through a **SOCKS tunnel** (e.g. `ssh -D`
+via a whitelisted jump host), set `LLM_SOCKS_PROXY=socks5://<host>:<port>`. Node's built-in
+`fetch` (undici) has **no SOCKS support** and ignores `ALL_PROXY` — so a tunnel that `curl`
+reaches is invisible to the worker without this. The proxy is scoped to the **LLM client
+only** (not the GitOps GitHub calls) and TLS/SNI to the real API host is preserved (no
+`/etc/hosts` trick needed). Leave it unset once the host is whitelisted — no code change.
+
+> **Running in a container:** `127.0.0.1` inside the container is the container, **not** the
+> host where the SSH tunnel listens. Use one of:
+> - host networking (`--network host` / `hostNetwork: true`) → `socks5://127.0.0.1:1080` works, or
+> - `LLM_SOCKS_PROXY=socks5://host.docker.internal:1080` + (Linux) `--add-host=host.docker.internal:host-gateway`, or
+> - the tunnel bound to the host's LAN IP and `socks5://<host-lan-ip>:1080`.
+
+> Implementation note: uses undici's own `fetch` + `Agent` + `fetch-socks` `socksConnector`
+> (NOT Node's global fetch) — mixing a `fetch-socks` dispatcher with Node's internal undici
+> fails with `UND_ERR_INVALID_ARG onRequestStart` (two undici instances). Covered by a live
+> loopback-SOCKS test.
+
+### GitOps PR-flow (optional — `DESIGN_gitops_pr_remediation.md`)
+
+The worker doubles as the private-network bridge to **GitHub Enterprise** (reachable only
+from here). When auth + a repo are configured, a second SQS handler opens PRs against the
+GitOps repo for remediations on Flux HelmRelease-managed workloads. Off unless set.
+
+**Auth: a PAT (simple, recommended for the initial phase) OR a GitHub App.** A PAT
+(`GITHUB_TOKEN`) is used directly and takes precedence; without it the App flow is used.
+Enabled when either auth + `GITOPS_REPO` are set.
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `GITHUB_API_URL` | GitHub API base — GHE = `https://<host>/api/v3` | `https://api.github.com` |
+| `GITHUB_TOKEN` | **PAT** (fine-grained → repo `contents:write`+`pull_requests:write`, else classic `repo`). Simplest; used directly | — |
+| `GITHUB_APP_ID` | GitHub App id (alternative to a PAT) | — |
+| `GITHUB_APP_INSTALLATION_ID` | App installation id on the GitOps repo | — |
+| `GITHUB_APP_PRIVATE_KEY` | App private key (PEM, inline) | — |
+| `GITHUB_APP_PRIVATE_KEY_FILE` | …or a path to the PEM (mounted secret) — takes precedence | — |
+| `GITOPS_REPO` | `owner/repo` — the ONLY repo the handler may touch | — |
+| `GITOPS_BRANCH` | Base branch for PRs | `main` |
+| `GITOPS_PATH_PREFIX` | Optional search-scope subtree (e.g. `apps/`) | — |
+| `SQS_GITOPS_REQUEST_QUEUE_NAME` | FIFO queue for GitOps requests | `gitops-request.fifo` |
 
 ## Reasoning-Model Handling
 
