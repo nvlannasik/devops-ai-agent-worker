@@ -10,7 +10,7 @@ import { config } from "./config.js";
 import { resolveQueueUrl, ensureRedrivePolicy } from "./sqs.js";
 import { parseSqsRequest } from "./message.js";
 import { callLLM } from "./llm.js";
-import logger from "./logger.js";
+import logger, { errDetail } from "./logger.js";
 import type { SQSResponse } from "./types.js";
 import { parseGitOpsRequest, type GitOpsResponse } from "./gitops/message.js";
 import { runGitOps, githubBackend } from "./gitops/handler.js";
@@ -104,7 +104,9 @@ async function processMessage(body: string, receiptHandle: string, queues: Queue
     return;
   }
 
-  logger.info(`Processing requestId=${req.requestId}`);
+  // traceId is the agent's Slack threadId — the join key between this log and the agent's
+  const trace = req.traceId ? ` trace=${req.traceId}` : "";
+  logger.info(`Processing requestId=${req.requestId}${trace} msgs=${req.messages?.length ?? 0} tools=${req.tools?.length ?? 0}`);
 
   // extend immediately so we don't hit the default 30s queue visibility timeout
   await extendVisibility(queues.request, receiptHandle, req.requestId);
@@ -112,14 +114,24 @@ async function processMessage(body: string, receiptHandle: string, queues: Queue
   // then keep extending periodically for long LLM calls
   const extender = startVisibilityExtender(queues.request, receiptHandle, req.requestId);
 
+  const started = Date.now();
   let response: SQSResponse;
   try {
     const llmResponse = await callLLM(req.messages, req.tools, req.systemPrompt);
     response = { requestId: req.requestId, response: llmResponse };
-    logger.info(`Done requestId=${req.requestId} stop=${llmResponse.stopReason} out=${llmResponse.usage?.outputTokens ?? "?"}`);
+    const blocks = llmResponse.content.map((c) => c.type).join(",") || "empty";
+    logger.info(
+      `Done requestId=${req.requestId}${trace} ${Date.now() - started}ms stop=${llmResponse.stopReason} ` +
+      `content=[${blocks}] in=${llmResponse.usage?.inputTokens ?? "?"} out=${llmResponse.usage?.outputTokens ?? "?"}`
+    );
+    // a model that never emits tool_use while tools were offered is usually a backend
+    // without its tool-call parser enabled — the agent then posts raw prose to Slack
+    if (req.tools?.length && !llmResponse.content.some((c) => c.type === "tool_use") && llmResponse.stopReason === "end_turn") {
+      logger.debug(`requestId=${req.requestId}${trace} answered without calling any of the ${req.tools.length} offered tools`);
+    }
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
-    logger.error(`LLM error requestId=${req.requestId}: ${error}`);
+    logger.error(`LLM error requestId=${req.requestId}${trace} after ${Date.now() - started}ms: ${errDetail(err)}`);
 
     await sqs.send(new SendMessageCommand({
       QueueUrl: queues.dlq,
@@ -134,23 +146,22 @@ async function processMessage(body: string, receiptHandle: string, queues: Queue
     clearInterval(extender);
   }
 
-  await Promise.all([
-    // publish response (success or error) so agent is not left waiting
-    sqs.send(new SendMessageCommand({
-      QueueUrl: queues.response,
-      MessageBody: JSON.stringify(response),
-      MessageGroupId: req.requestId,
-      MessageDeduplicationId: req.requestId,
-    })),
-    // delete processed request
-    sqs.send(new DeleteMessageCommand({
-      QueueUrl: queues.request,
-      ReceiptHandle: receiptHandle,
-    })),
-  ]);
+  // Publish BEFORE deleting, and sequentially. Run concurrently, a failed publish could
+  // still be paired with a successful delete: the request is gone, no reply ever arrives,
+  // and the agent blocks until its timeout with nothing in either log to explain it.
+  // Publish-then-delete means a delete failure only costs a redelivery (duplicate LLM
+  // call, whose duplicate reply the agent's tombstone drops) — recoverable, unlike a loss.
+  await sqs.send(new SendMessageCommand({
+    QueueUrl: queues.response,
+    MessageBody: JSON.stringify(response),
+    MessageGroupId: req.requestId,
+    MessageDeduplicationId: req.requestId,
+  }));
   // logged AFTER the publish so "reply sent" is observable — "Done" above is only
   // "LLM finished", before the response actually reaches the response queue
-  logger.info(`Replied requestId=${req.requestId} (${response.error ? "error" : "ok"})`);
+  logger.info(`Replied requestId=${req.requestId}${trace} (${response.error ? "error" : "ok"})`);
+
+  await sqs.send(new DeleteMessageCommand({ QueueUrl: queues.request, ReceiptHandle: receiptHandle }));
 }
 
 // GitOps PR-flow message: parse → run the op → publish the result on the SHARED response
@@ -170,7 +181,7 @@ async function processGitOpsMessage(body: string, receiptHandle: string, queueUr
     response = { requestId: req.requestId, response: await runGitOps(req, backend) };
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
-    logger.error(`GitOps error requestId=${req.requestId}: ${error}`);
+    logger.error(`GitOps error requestId=${req.requestId}: ${errDetail(err)}`);
     response = { requestId: req.requestId, error };
   }
 
@@ -214,13 +225,13 @@ async function pollLoop(
       logger.debug(`[${label}] received ${messages.length} message(s) (in-flight ${inFlight.size})`);
       for (const msg of messages) {
         const task = handle(msg.Body!, msg.ReceiptHandle!)
-          .catch((err) => { logger.error(`[${label}] handler failed: ${err instanceof Error ? err.message : err}`); })
+          .catch((err) => { logger.error(`[${label}] handler failed (message will redeliver): ${errDetail(err)}`); })
           .finally(() => inFlight.delete(task));
         inFlight.add(task);
       }
     } catch (err) {
       if (signal.aborted) break;
-      logger.error(`[${label}] poll error: ${err} — retrying in 5s`);
+      logger.error(`[${label}] poll error — retrying in 5s: ${errDetail(err)}`);
       await new Promise((r) => setTimeout(r, 5000));
     }
   }

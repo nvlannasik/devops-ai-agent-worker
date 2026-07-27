@@ -29,6 +29,45 @@ export function parseSocksProxy(url: string): { type: 4 | 5; host: string; port:
 
 export type SocksProxyCfg = NonNullable<ReturnType<typeof parseSocksProxy>>;
 
+// The agent speaks Anthropic-shaped content blocks; the private LLM speaks OpenAI chat.
+// This used to be `JSON.stringify(m.content)` — which put the literal
+// `[{"type":"tool_use",...}]` into the prompt as TEXT. A big model ignores the noise; a
+// small one imitates it and answers with that JSON instead of calling a tool, which the
+// agent then posts to Slack verbatim (and re-stringifies next turn → nested escaping).
+// tool_use → assistant.tool_calls, tool_result → a role:"tool" message. Exported for tests.
+export function toOpenAIMessages(messages: Message[]): OpenAI.Chat.ChatCompletionMessageParam[] {
+  const out: OpenAI.Chat.ChatCompletionMessageParam[] = [];
+  for (const m of messages) {
+    if (typeof m.content === "string") {
+      out.push({ role: m.role, content: m.content });
+      continue;
+    }
+    const text = m.content
+      .filter((b) => b.type === "text")
+      .map((b) => b.text ?? "")
+      .join("\n");
+
+    if (m.role === "assistant") {
+      const toolCalls = m.content
+        .filter((b) => b.type === "tool_use")
+        .map((b) => ({
+          id: b.id ?? "",
+          type: "function" as const,
+          function: { name: b.name ?? "", arguments: JSON.stringify(b.input ?? {}) },
+        }));
+      out.push({ role: "assistant", content: text, ...(toolCalls.length > 0 && { tool_calls: toolCalls }) });
+      continue;
+    }
+    // user turn: tool results must come FIRST — OpenAI requires every tool message to
+    // follow the assistant turn that requested it, before any new user text
+    for (const b of m.content.filter((b) => b.type === "tool_result")) {
+      out.push({ role: "tool", tool_call_id: b.tool_use_id ?? "", content: b.content ?? "" });
+    }
+    if (text) out.push({ role: "user", content: text });
+  }
+  return out;
+}
+
 // A fetch that dials through the SOCKS proxy. Uses undici's OWN fetch + Agent (not Node's
 // global fetch): the connector's dispatcher must come from the SAME undici that runs the
 // request, or the handler interfaces mismatch (UND_ERR_INVALID_ARG onRequestStart). TLS/SNI
@@ -88,13 +127,7 @@ async function requestOnce(
     ...(config.llm.topP !== undefined && { top_p: config.llm.topP }),
     ...(config.llm.seed !== undefined && { seed: config.llm.seed }),
     stream: false,
-    messages: [
-      { role: "system", content: systemPrompt },
-      ...messages.map((m) => ({
-        role: m.role,
-        content: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
-      })),
-    ],
+    messages: [{ role: "system", content: systemPrompt }, ...toOpenAIMessages(messages)],
     // omit tools entirely when the agent disables them (tool budget reached) —
     // some OpenAI-compatible backends reject an empty tools array
     ...(tools.length > 0 && {

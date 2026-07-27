@@ -78,7 +78,7 @@ test("an unresolvable change refuses without touching GitHub", async () => {
   const { backend, calls } = fakeBackend([noValue]);
   const r = await runGitOps(scaleReq("open_pr"), backend);
   assert.equal(r.ok, false);
-  assert.match(r.ok ? "" : r.reason, /not set inline/);
+  assert.match(r.ok ? "" : r.reason, /not set in the overlay/);
   assert.equal(calls.createBranch, undefined);
   assert.equal(calls.putFile, undefined);
 });

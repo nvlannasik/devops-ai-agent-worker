@@ -37,6 +37,9 @@ export interface SQSRequest {
   messages: Message[];
   tools: ToolDefinition[];
   systemPrompt: string;
+  // the agent's Slack threadId — logging only, so the agent log, this worker's log and
+  // the Slack thread all join on one id. Optional: older agents don't send it.
+  traceId?: string;
 }
 
 export interface SQSResponse {

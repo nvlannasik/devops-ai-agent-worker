@@ -1,4 +1,4 @@
-import { resolveGitOpsEdit, tagOf, type RepoFile, type ChangeSpec, type ResolveResult } from "./resolve.js";
+import { resolveGitOpsEdit, deriveBasePrefix, tagOf, type RepoFile, type ChangeSpec, type ResolveResult } from "./resolve.js";
 import { GitHubClient } from "./github-client.js";
 import type { GitOpsRequest, GitOpsPayload } from "./message.js";
 
@@ -33,11 +33,14 @@ export function prBody(req: GitOpsRequest, resolved: ResolvedEdit): string {
   const rows = req.changes.map((c) => `| \`${c.field}\` | \`${c.from}\` | \`${c.to}\` |`).join("\n");
   const container = req.container ? ` · **Container:** \`${req.container}\`` : "";
   const thread = req.incident?.threadUrl ? `\n\n**Incident thread:** ${req.incident.threadUrl}` : "";
+  const addedNote = resolved.addedFromBase
+    ? "\n> ℹ️ This value wasn't overridden in the overlay yet — it was only in **base**. Added it to the overlay to override base **for this environment only**."
+    : "";
   return [
     `### 🔧 Automated remediation — \`${req.helmRelease.name}\``,
     "",
     `**Workload:** Flux HelmRelease \`${req.helmRelease.namespace}/${req.helmRelease.name}\`${container}`,
-    `**File:** \`${resolved.path}\` · **values key:** \`${resolved.valuesKey}\``,
+    `**File:** \`${resolved.path}\` · **values key:** \`${resolved.valuesKey}\`${addedNote}`,
     "",
     "| Field | From | To |",
     "|-------|------|----|",
@@ -59,8 +62,14 @@ export function prBody(req: GitOpsRequest, resolved: ResolvedEdit): string {
 
 export async function runGitOps(req: GitOpsRequest, backend: GitOpsBackend): Promise<GitOpsPayload> {
   const files = await backend.listCandidateFiles(req.pathPrefix);
-  const spec: ChangeSpec = { action: req.action, container: req.container, changes: req.changes };
-  const resolved = resolveGitOpsEdit(files, req.helmRelease, spec);
+  const spec: ChangeSpec = { action: req.action, container: req.container, changes: req.changes, component: req.component };
+  let resolved = resolveGitOpsEdit(files, req.helmRelease, spec);
+  // value not in the overlay but might be in base → learn the path from base and add it to
+  // the overlay (only when we know the overlay prefix, so we can derive the base prefix).
+  if (!resolved.ok && resolved.tryBase && req.pathPrefix) {
+    const basePrefix = deriveBasePrefix(req.pathPrefix);
+    if (basePrefix) resolved = resolveGitOpsEdit(files, req.helmRelease, spec, await backend.listCandidateFiles(basePrefix));
+  }
   if (!resolved.ok) return { ok: false, reason: resolved.reason };
 
   if (req.op === "dry_run") {

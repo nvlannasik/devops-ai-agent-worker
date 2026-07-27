@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { resolveGitOpsEdit, tagOf, type RepoFile, type ChangeSpec } from "./resolve.js";
+import { resolveGitOpsEdit, deriveBasePrefix, tagOf, type RepoFile, type ChangeSpec } from "./resolve.js";
 
 const HR = { name: "ingress-nginx", namespace: "nginx-ingress" };
 
@@ -74,7 +74,7 @@ test("refuses when the value is not set inline (overlay / chart default)", () =>
   const files = [release("      service:\n        type: LoadBalancer")]; // no tag/replicaCount
   const r = resolveGitOpsEdit(files, HR, imageChange("repo/a:1.0", "repo/a:2.0"));
   assert.equal(r.ok, false);
-  assert.match(r.ok ? "" : r.reason, /not set inline/);
+  assert.match(r.ok ? "" : r.reason, /not set in the overlay/);
 });
 
 test("refuses when multiple lines match the current value (ambiguous)", () => {
@@ -84,9 +84,144 @@ test("refuses when multiple lines match the current value (ambiguous)", () => {
   assert.match(r.ok ? "" : r.reason, /2 lines .* match/);
 });
 
-test("refuses set_resources (not supported by the PR flow yet)", () => {
-  const files = [release("      resources:\n        limits:\n          memory: 512Mi")];
-  const r = resolveGitOpsEdit(files, HR, { action: "set_resources", container: "controller", changes: [{ field: "limits.memory", from: "512Mi", to: "1Gi" }] });
+test("set_resources edits the right nested leaf (limits.memory, not requests.memory)", () => {
+  const files = [release("      resources:\n        requests:\n          memory: 256Mi\n          cpu: 250m\n        limits:\n          memory: 512Mi\n          cpu: 500m")];
+  const r = resolveGitOpsEdit(files, HR, {
+    action: "set_resources",
+    container: "controller",
+    changes: [{ field: "limits.memory", from: "512Mi", to: "1Gi" }],
+  });
+  assert.ok(r.ok);
+  assert.ok(r.ok && r.newContent.includes("memory: 1Gi") && r.newContent.includes("memory: 256Mi")); // limits changed, requests untouched
+  assert.ok(r.ok && r.diff.includes("-          memory: 512Mi") && r.diff.includes("+          memory: 1Gi"));
+});
+
+test("set_resources applies multiple changes and reports them", () => {
+  const files = [release("      resources:\n        requests:\n          cpu: 250m\n        limits:\n          memory: 512Mi")];
+  const r = resolveGitOpsEdit(files, HR, {
+    action: "set_resources",
+    changes: [
+      { field: "requests.cpu", from: "250m", to: "500m" },
+      { field: "limits.memory", from: "512Mi", to: "1Gi" },
+    ],
+  });
+  assert.ok(r.ok);
+  assert.ok(r.ok && r.newContent.includes("cpu: 500m") && r.newContent.includes("memory: 1Gi"));
+  assert.equal(r.ok && r.valuesKey, "requests.cpu, limits.memory");
+});
+
+test("set_resources refuses when the value isn't set inline", () => {
+  const files = [release("      service:\n        type: LoadBalancer")]; // no resources block
+  const r = resolveGitOpsEdit(files, HR, { action: "set_resources", changes: [{ field: "limits.memory", from: "512Mi", to: "1Gi" }] });
   assert.equal(r.ok, false);
-  assert.match(r.ok ? "" : r.reason, /set_resources is not supported/);
+  assert.match(r.ok ? "" : r.reason, /not set in the overlay/);
+});
+
+// ---- base → overlay ADD (value only in base) ----
+
+const HR2 = { name: "headlamp", namespace: "flux-system" };
+const overlayNoScale: RepoFile = {
+  path: "apps/dev/systems/headlamp/release.yaml",
+  content: `kind: HelmRelease
+metadata:
+  name: headlamp
+  namespace: flux-system
+spec:
+  values:
+    image:
+      tag: v0.43.0`,
+};
+const baseWithScale: RepoFile = {
+  path: "apps/base/systems/headlamp/release.yaml",
+  content: `kind: HelmRelease
+metadata:
+  name: headlamp
+  namespace: flux-system
+spec:
+  values:
+    replicaCount: 1
+    resources:
+      limits:
+        memory: 512Mi`,
+};
+
+test("deriveBasePrefix swaps the env segment for base", () => {
+  assert.equal(deriveBasePrefix("apps/dev/systems"), "apps/base/systems");
+  assert.equal(deriveBasePrefix("apps/prd/applications/"), "apps/base/applications");
+  assert.equal(deriveBasePrefix("apps/base/systems"), undefined); // already base
+  assert.equal(deriveBasePrefix("single"), undefined);
+});
+
+test("value absent from overlay signals tryBase (no base files given)", () => {
+  const r = resolveGitOpsEdit([overlayNoScale], HR2, { action: "scale", changes: [{ field: "replicas", from: 1, to: 3 }] });
+  assert.equal(r.ok, false);
+  assert.ok(!r.ok && r.tryBase);
+});
+
+test("scale not in overlay but in base → ADDS replicaCount to the overlay", () => {
+  const r = resolveGitOpsEdit([overlayNoScale], HR2, { action: "scale", changes: [{ field: "replicas", from: 1, to: 3 }] }, [baseWithScale]);
+  assert.ok(r.ok && r.addedFromBase);
+  assert.ok(r.ok && /replicaCount: 3/.test(r.newContent));
+  assert.ok(r.ok && r.newContent.includes("tag: v0.43.0")); // existing overlay value untouched
+});
+
+test("resources not in overlay but in base → ADDS the nested path to the overlay", () => {
+  const r = resolveGitOpsEdit([overlayNoScale], HR2, { action: "set_resources", changes: [{ field: "limits.memory", from: "512Mi", to: "1Gi" }] }, [baseWithScale]);
+  assert.ok(r.ok && r.addedFromBase);
+  assert.ok(r.ok && /resources:/.test(r.newContent) && /memory: 1Gi/.test(r.newContent));
+});
+
+test("value in neither overlay nor base → refuse (chart default)", () => {
+  const emptyBase: RepoFile = { path: "apps/base/x/release.yaml", content: "kind: HelmRelease\nmetadata:\n  name: headlamp\nspec:\n  values: {}" };
+  const r = resolveGitOpsEdit([overlayNoScale], HR2, { action: "scale", changes: [{ field: "replicas", from: 1, to: 3 }] }, [emptyBase]);
+  assert.equal(r.ok, false);
+  assert.match(r.ok ? "" : r.reason, /neither the overlay nor base|isn't set in base/);
+});
+
+test("base-add REFUSES when the key is ambiguous in base — never guesses which to override", () => {
+  const ambiguousBase: RepoFile = {
+    path: "apps/base/systems/headlamp/release.yaml",
+    content: `kind: HelmRelease
+metadata:
+  name: headlamp
+spec:
+  values:
+    controller:
+      replicaCount: 1
+    proxy:
+      replicaCount: 1`,
+  };
+  const r = resolveGitOpsEdit([overlayNoScale], HR2, { action: "scale", changes: [{ field: "replicas", from: 1, to: 3 }] }, [ambiguousBase]);
+  assert.equal(r.ok, false);
+  assert.match(r.ok ? "" : r.reason, /refusing to guess/);
+});
+
+// ---- component-aware disambiguation (multi-component charts) ----
+
+test("multi-component same value: the component label picks the right replicaCount (edit)", () => {
+  const files = [release("      replicaCount: 1\n    proxy:\n      replicaCount: 1")]; // controller + proxy, both 1
+  const amb = resolveGitOpsEdit(files, HR, { action: "scale", changes: [{ field: "replicas", from: 1, to: 3 }] });
+  assert.equal(amb.ok, false); // no component → ambiguous
+  assert.match(amb.ok ? "" : amb.reason, /refusing to guess/);
+
+  const ctrl = resolveGitOpsEdit(files, HR, { action: "scale", changes: [{ field: "replicas", from: 1, to: 3 }], component: "controller" });
+  assert.ok(ctrl.ok && ctrl.newContent.indexOf("replicaCount: 3") < ctrl.newContent.indexOf("proxy:")); // controller's (before proxy)
+
+  const proxy = resolveGitOpsEdit(files, HR, { action: "scale", changes: [{ field: "replicas", from: 1, to: 3 }], component: "proxy" });
+  assert.ok(proxy.ok && proxy.newContent.indexOf("replicaCount: 3") > proxy.newContent.indexOf("proxy:")); // proxy's (after)
+});
+
+test("multi-component base-add: component picks which sub-tree to override; unknown component still refuses", () => {
+  const overlay: RepoFile = { path: "apps/dev/x/release.yaml", content: "kind: HelmRelease\nmetadata:\n  name: multi\nspec:\n  values:\n    image:\n      tag: v1" };
+  const base: RepoFile = { path: "apps/base/x/release.yaml", content: "kind: HelmRelease\nmetadata:\n  name: multi\nspec:\n  values:\n    controller:\n      replicaCount: 1\n    worker:\n      replicaCount: 1" };
+  const hr = { name: "multi", namespace: "x" };
+
+  const amb = resolveGitOpsEdit([overlay], hr, { action: "scale", changes: [{ field: "replicas", from: 1, to: 2 }] }, [base]);
+  assert.equal(amb.ok, false); // ambiguous in base, no component
+
+  const worker = resolveGitOpsEdit([overlay], hr, { action: "scale", changes: [{ field: "replicas", from: 1, to: 2 }], component: "worker" }, [base]);
+  assert.ok(worker.ok && worker.addedFromBase && /worker:/.test(worker.newContent) && /replicaCount: 2/.test(worker.newContent));
+
+  const unknown = resolveGitOpsEdit([overlay], hr, { action: "scale", changes: [{ field: "replicas", from: 1, to: 2 }], component: "sidecar" }, [base]);
+  assert.equal(unknown.ok, false); // component not in base → doesn't narrow → still refuses (never guesses)
 });

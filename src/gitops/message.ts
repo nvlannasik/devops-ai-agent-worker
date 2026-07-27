@@ -15,6 +15,9 @@ export interface GitOpsRequest {
   helmRelease: { name: string; namespace: string };
   action: "set_image" | "scale" | "set_resources";
   container?: string;
+  // chart component (workload's app.kubernetes.io/component label) — disambiguates which
+  // values sub-tree to edit when a multi-component chart repeats replicaCount/resources.
+  component?: string;
   changes: GitOpsChangeMsg[];
   // repo subtree to search — the agent auto-detects it from the Flux Kustomization's
   // spec.path (per-environment overlay, e.g. "apps/dev/applications"). Falls back to the
