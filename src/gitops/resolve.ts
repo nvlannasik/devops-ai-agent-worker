@@ -43,9 +43,20 @@ export interface HelmReleaseRef {
   namespace: string;
 }
 
+// Cluster/Git drift: the overlay DOES declare this key, but to a different value than the
+// one running in the cluster. Somebody changed the cluster outside GitOps. Editing the file
+// would be wrong (the incident's `from` is not what Git says), and so is "not set in the
+// overlay" — the honest answer is "reconcile, Git is the source of truth".
+export interface DriftInfo {
+  path: string; // repo file that declares the value
+  valuesKey: string; // the key inside spec.values
+  gitValue: string; // what the GitOps repo declares
+  clusterValue: string; // what is actually running (the incident context's `from`)
+}
+
 export type ResolveResult =
   | { ok: true; path: string; valuesKey: string; before: string; after: string; newContent: string; diff: string; addedFromBase?: boolean }
-  | { ok: false; reason: string; tryBase?: boolean }; // tryBase = value absent from overlay → the caller may retry with base files
+  | { ok: false; reason: string; tryBase?: boolean; drift?: DriftInfo }; // tryBase = value absent from overlay → the caller may retry with base files
 
 const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -100,6 +111,7 @@ interface ResourceMatch {
   lineIdx: number;
   indent: string;
   quote: string;
+  value: string;
   comment: string;
   path: string[];
 }
@@ -108,10 +120,12 @@ interface ResourceMatch {
 // somewhere under a `resources:` block — via an indentation-tracked parent stack. This is how
 // `limits.memory` is disambiguated from `requests.memory` (same leaf/value, different parent).
 // `path` (ancestor keys) lets the caller further narrow by chart component.
-function findResourceMatches(lines: string[], parentKey: string, leafKey: string, from: string): ResourceMatch[] {
+// `from` undefined = match the key whatever its value is (drift detection); the captured
+// value then says what Git declares.
+function findResourceMatches(lines: string[], parentKey: string, leafKey: string, from?: string): ResourceMatch[] {
   const out: ResourceMatch[] = [];
   const stack: Array<{ indent: number; key: string }> = []; // enclosing block headers
-  const leafRe = new RegExp(`^(\\s*)${escapeRe(leafKey)}:\\s*(["']?)${escapeRe(from)}\\2\\s*(#.*)?$`);
+  const leafRe = new RegExp(`^(\\s*)${escapeRe(leafKey)}:\\s*(["']?)(.*?)\\2\\s*(#.*)?$`);
   const headerRe = /^(\s*)([\w.\-/]+):\s*(#.*)?$/; // "key:" with nothing (or a comment) after
 
   for (let i = 0; i < lines.length; i++) {
@@ -121,10 +135,10 @@ function findResourceMatches(lines: string[], parentKey: string, leafKey: string
     while (stack.length && stack[stack.length - 1].indent >= indent) stack.pop();
 
     const leaf = line.match(leafRe);
-    if (leaf) {
+    if (leaf && leaf[3] && (from === undefined || leaf[3] === from)) {
       const parent = stack[stack.length - 1];
       if (parent && parent.key === parentKey && stack.some((s) => s.key === "resources")) {
-        out.push({ lineIdx: i, indent: leaf[1], quote: leaf[2], comment: leaf[3] ? ` ${leaf[3]}` : "", path: [...stack.map((s) => s.key), leafKey] });
+        out.push({ lineIdx: i, indent: leaf[1], quote: leaf[2], value: leaf[3], comment: leaf[4] ? ` ${leaf[4]}` : "", path: [...stack.map((s) => s.key), leafKey] });
       }
       continue;
     }
@@ -144,6 +158,12 @@ function resolveResourceEdit(path: string, lines: string[], changes: GitOpsChang
     if (!parentKey || !leafKey || rest.length) return { ok: false, reason: `unexpected resource field \`${c.field}\` (expected <requests|limits>.<cpu|memory>)` };
     const matches = narrowByComponent(findResourceMatches(lines, parentKey, leafKey, String(c.from)), component);
     if (matches.length === 0) {
+      // same drift-vs-absent distinction as editInFile: re-scan by key alone
+      const byKey = narrowByComponent(findResourceMatches(lines, parentKey, leafKey), component);
+      if (byKey.length === 1 && byKey[0].value !== String(c.from)) {
+        const drift: DriftInfo = { path, valuesKey: `resources.${c.field}`, gitValue: byKey[0].value, clusterValue: String(c.from) };
+        return { ok: false, reason: driftReason(drift), drift };
+      }
       return { ok: false, reason: `\`resources.${c.field}\` is not set in the overlay \`${path}\``, tryBase: true };
     }
     if (matches.length > 1) return { ok: false, reason: `ambiguous: ${matches.length} lines match \`resources.${c.field}\` in \`${path}\`${component ? ` even within component \`${component}\`` : ""} — refusing to guess` };
@@ -203,6 +223,55 @@ function findMatches(lines: string[], specs: SearchSpec[]): LineMatch[] {
   return out;
 }
 
+// Same scan as findMatches, but keyed on the KEY only — whatever value is there is captured.
+// This is what tells "the overlay doesn't set this at all" apart from "the overlay sets it
+// to something else", which are indistinguishable to a value-matching search and were both
+// reported as "not set in the overlay".
+function findKeyLines(lines: string[], keys: string[]): Array<{ key: string; value: string; path: string[] }> {
+  const out: Array<{ key: string; value: string; path: string[] }> = [];
+  const stack: Array<{ indent: number; key: string }> = [];
+  const headerRe = /^(\s*)([\w.\-/]+):\s*(#.*)?$/;
+  lines.forEach((line) => {
+    if (!line.trim() || line.trimStart().startsWith("#")) return;
+    const indent = line.length - line.trimStart().length;
+    while (stack.length && stack[stack.length - 1].indent >= indent) stack.pop();
+    if (headerRe.test(line)) {
+      stack.push({ indent, key: line.match(headerRe)![2] });
+      return;
+    }
+    for (const key of keys) {
+      const m = line.match(new RegExp(`^\\s*${escapeRe(key)}:\\s*(["']?)(.*?)\\1\\s*(#.*)?$`));
+      if (m && m[2]) out.push({ key, value: m[2], path: [...stack.map((s) => s.key), key] });
+    }
+  });
+  return out;
+}
+
+// The value-matching search found nothing — is that because the overlay is silent about the
+// key, or because Git and the cluster disagree? Exactly one key match with a different value
+// is drift. Anything ambiguous stays undefined (caller falls back to the base-add path).
+function detectDrift(path: string, lines: string[], specs: SearchSpec[], component?: string): DriftInfo | undefined {
+  for (const spec of specs) {
+    const found = narrowByComponent(findKeyLines(lines, spec.keys), component);
+    if (found.length !== 1) continue;
+    const git = found[0];
+    if (git.value === spec.from) continue; // findMatches would have matched — not drift
+    return { path, valuesKey: git.path.join("."), gitValue: git.value, clusterValue: spec.from };
+  }
+  return undefined;
+}
+
+// One sentence the agent and the human both read. States the direction explicitly: Git is
+// the source of truth, so the fix is to reconcile the cluster back, not to write a PR that
+// would encode a value nobody declared.
+function driftReason(d: DriftInfo): string {
+  return (
+    `cluster/GitOps drift: \`${d.valuesKey}\` is \`${d.gitValue}\` in \`${d.path}\` but the cluster is running \`${d.clusterValue}\` — ` +
+    `something changed the cluster outside the GitOps repo. The repo is the source of truth, so the fix is a Flux reconcile ` +
+    `(restoring \`${d.gitValue}\`), not a PR. Open a PR only if \`${d.clusterValue}\` is the value that should be declared.`
+  );
+}
+
 function unifiedDiff(path: string, lineIdx: number, before: string, after: string): string {
   return [`--- a/${path}`, `+++ b/${path}`, `@@ line ${lineIdx + 1} @@`, `-${before}`, `+${after}`].join("\n");
 }
@@ -215,7 +284,12 @@ function editInFile(path: string, lines: string[], spec: ChangeSpec): ResolveRes
   const built = searchSpecs(spec);
   if ("error" in built) return { ok: false, reason: built.error };
   const matches = narrowByComponent(findMatches(lines, built.specs), spec.component);
-  if (matches.length === 0) return { ok: false, reason: `the value is not set in the overlay \`${path}\``, tryBase: true };
+  if (matches.length === 0) {
+    // drift beats "not set": the key IS declared here, just not with the running value
+    const drift = detectDrift(path, lines, built.specs, spec.component);
+    if (drift) return { ok: false, reason: driftReason(drift), drift };
+    return { ok: false, reason: `the value is not set in the overlay \`${path}\``, tryBase: true };
+  }
   if (matches.length > 1) return { ok: false, reason: `ambiguous: ${matches.length} lines in \`${path}\` match the current value${spec.component ? ` even within component \`${spec.component}\`` : ""} — refusing to guess` };
 
   const m = matches[0];
@@ -275,21 +349,25 @@ function findKeyPaths(lines: string[], m: KeyMatcher): string[][] {
 
 // Per-change {matcher, value to write, label}. Only scale + set_resources support base-add
 // (image tags essentially always live in overlays).
-function baseMatchers(spec: ChangeSpec): Array<{ matcher: KeyMatcher; to: string | number; label: string }> | { error: string } {
+function baseMatchers(spec: ChangeSpec): Array<{ matcher: KeyMatcher; from: string; to: string | number; label: string }> | { error: string } {
   if (spec.action === "scale") {
     const c = spec.changes[0];
-    return [{ matcher: { leafKeys: ["replicaCount", "replicas"], ancestorKey: "values" }, to: Number(c.to), label: "replicaCount" }];
+    if (!c) return { error: "no replica change provided" };
+    return [{ matcher: { leafKeys: ["replicaCount", "replicas"], ancestorKey: "values" }, from: String(c.from), to: Number(c.to), label: "replicaCount" }];
   }
   if (spec.action === "set_resources") {
     return spec.changes.map((c) => {
       const [parentKey, leafKey] = String(c.field).split(".");
-      return { matcher: { leafKeys: [leafKey], parentKey, ancestorKey: "resources" }, to: String(c.to), label: `resources.${c.field}` };
+      return { matcher: { leafKeys: [leafKey], parentKey, ancestorKey: "resources" }, from: String(c.from), to: String(c.to), label: `resources.${c.field}` };
     });
   }
   return { error: "not supported by base-add" };
 }
 
-// Purely-additive diff (setIn only inserts) — the lines present in `next` but not `prev`.
+// Diff for the base→overlay ADD path. setIn only inserts here (an existing key is refused
+// upstream), but `yaml`'s toString() can still re-emit unrelated lines differently. Anything
+// from `prev` that didn't survive is reported as a removal rather than dropped — a human
+// approves this diff, so it must never claim a change is purely additive when it isn't.
 function additiveDiff(path: string, prev: string, next: string): string {
   const a = prev.split("\n");
   const b = next.split("\n");
@@ -299,7 +377,8 @@ function additiveDiff(path: string, prev: string, next: string): string {
     if (i < a.length && a[i] === line) i++;
     else added.push(`+${line}`);
   }
-  return [`--- a/${path}`, `+++ b/${path}`, `@@ added to spec.values @@`, ...added].join("\n");
+  const removed = a.slice(i).map((line) => `-${line}`);
+  return [`--- a/${path}`, `+++ b/${path}`, `@@ added to spec.values @@`, ...added, ...removed].join("\n");
 }
 
 function addFromBase(overlay: RepoFile, baseFiles: RepoFile[], hr: HelmReleaseRef, spec: ChangeSpec): ResolveResult {
@@ -313,11 +392,23 @@ function addFromBase(overlay: RepoFile, baseFiles: RepoFile[], hr: HelmReleaseRe
 
   const doc = parseDocument(overlay.content);
   const added: string[] = [];
-  for (const { matcher, to, label } of matchers) {
+  for (const { matcher, from, to, label } of matchers) {
     // narrowByComponent operates on {path}; wrap the raw paths to reuse it
     const paths = narrowByComponent(findKeyPaths(baseLines, matcher).map((path) => ({ path })), spec.component).map((w) => w.path);
     if (paths.length === 0) return { ok: false, reason: `\`${label}\` isn't set in base either — it's a chart default; set it explicitly in the overlay` };
     if (paths.length > 1) return { ok: false, reason: `ambiguous: \`${label}\` appears ${paths.length}× in base${spec.component ? ` even within component \`${spec.component}\`` : ""} — refusing to guess where to override` };
+    // We got here because the line-based search found no `<key>: <from>` in the overlay —
+    // which is also what happens when the overlay DOES set the key but to a different value
+    // (a stale `from` in the incident context). setIn would then silently REPLACE the
+    // operator's value while additiveDiff rendered it as a clean insertion. Refuse instead:
+    // "only change an already-set key, never guess" cuts both ways.
+    if (doc.hasIn(paths[0])) {
+      const existing = doc.getIn(paths[0]);
+      return {
+        ok: false,
+        reason: `\`${label}\` IS already set to \`${String(existing)}\` in the overlay \`${overlay.path}\`, but the incident context expected \`${from}\` — the context is stale, so overriding it now could undo a deliberate change. Re-check the current value and re-run.`,
+      };
+    }
     doc.setIn(paths[0], to);
     added.push(`${paths[0].slice(2).join(".")} = ${to}`); // strip spec.values for display
   }

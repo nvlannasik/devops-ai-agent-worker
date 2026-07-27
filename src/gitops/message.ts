@@ -31,7 +31,10 @@ export interface GitOpsRequest {
 export type GitOpsPayload =
   | { ok: true; op: "dry_run"; path: string; valuesKey: string; before: string; after: string; diff: string }
   | { ok: true; op: "open_pr"; path: string; prUrl: string }
-  | { ok: false; reason: string };
+  // `drift` present = the repo declares this key, but the cluster is running something else
+  // (changed outside GitOps). The agent turns that into a Flux reconcile proposal instead of
+  // a PR — the repo is the source of truth.
+  | { ok: false; reason: string; drift?: { path: string; valuesKey: string; gitValue: string; clusterValue: string } };
 
 export interface GitOpsResponse {
   requestId: string;

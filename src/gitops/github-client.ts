@@ -1,4 +1,5 @@
 import { getInstallationToken } from "./github-app.js";
+import logger from "../logger.js";
 
 // Thin GitHub REST client over fetch (no @octokit). Only the calls the PR flow needs:
 // read the repo tree + files, create a branch, commit one file, open a PR. Works against
@@ -34,6 +35,8 @@ export class GitHubClient {
   }
 
   private async api(path: string, init: RequestInit = {}): Promise<unknown> {
+    const method = init.method ?? "GET";
+    const start = Date.now();
     const res = await this.fetchImpl(`${this.cfg.apiUrl}${path}`, {
       ...init,
       headers: {
@@ -44,7 +47,16 @@ export class GitHubClient {
         ...init.headers,
       },
     });
-    if (!res.ok) throw new Error(`GitHub ${init.method ?? "GET"} ${path} failed: ${res.status} ${await res.text().catch(() => "")}`);
+    // this flow mutates a Git repo but was entirely silent — when a PR half-completes
+    // (branch created, commit failed) the log has to show which call got how far
+    logger.debug(`[github] ${method} ${path} → ${res.status} (${Date.now() - start}ms)`);
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      // rate-limit exhaustion looks like a plain 403; name it so it isn't read as authz
+      const remaining = res.headers.get("x-ratelimit-remaining");
+      const rate = remaining === "0" ? ` (rate limit exhausted, resets at ${res.headers.get("x-ratelimit-reset") ?? "?"})` : "";
+      throw new Error(`GitHub ${method} ${path} failed: ${res.status}${rate} ${body.slice(0, 500)}`);
+    }
     return res.status === 204 ? undefined : res.json();
   }
 
@@ -52,10 +64,22 @@ export class GitHubClient {
   async listYamlFiles(branch: string, pathPrefix = ""): Promise<string[]> {
     const tree = (await this.api(`/repos/${this.cfg.repo}/git/trees/${encodeURIComponent(branch)}?recursive=1`)) as {
       tree: Array<{ path: string; type: string }>;
+      truncated?: boolean;
     };
-    return tree.tree
+    // GitHub silently truncates a recursive tree past ~100k entries / 7MB. The missing
+    // files then just don't exist as far as the resolver is concerned, so the agent
+    // reports "value not found in the overlay" — a wrong answer with no error anywhere.
+    if (tree.truncated) {
+      throw new Error(
+        `GitHub returned a TRUNCATED tree for ${this.cfg.repo}@${branch} — the file list is incomplete, so a "not found" ` +
+        `result would be wrong. Narrow the search with GITOPS_PATH_PREFIX (currently "${pathPrefix || "(none)"}").`
+      );
+    }
+    const files = tree.tree
       .filter((e) => e.type === "blob" && /\.ya?ml$/.test(e.path) && e.path.startsWith(pathPrefix))
       .map((e) => e.path);
+    logger.debug(`[github] tree ${branch} prefix="${pathPrefix}" → ${files.length} yaml file(s) of ${tree.tree.length} entries`);
+    return files;
   }
 
   async getFile(path: string, branch: string): Promise<{ content: string; sha: string }> {

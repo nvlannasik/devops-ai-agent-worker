@@ -117,6 +117,60 @@ test("set_resources refuses when the value isn't set inline", () => {
   assert.match(r.ok ? "" : r.reason, /not set in the overlay/);
 });
 
+// ---- cluster/GitOps drift ----
+// Someone changes an image tag straight in the cluster. The incident context then carries the
+// DRIFTED value as `from`, so the value-matching search misses and the old code answered
+// "the value is not set in the overlay" — which is false and unactionable.
+
+const overlayWithTag: RepoFile = {
+  path: "apps/dev/applications/api/release.yaml",
+  content: `kind: HelmRelease
+metadata:
+  name: api
+  namespace: flux-system
+spec:
+  values:
+    image:
+      repository: registry.local/api
+      tag: v1.4.0`,
+};
+
+test("image tag changed in-cluster is reported as drift, not as 'not set in the overlay'", () => {
+  const r = resolveGitOpsEdit([overlayWithTag], { name: "api", namespace: "flux-system" }, {
+    action: "set_image",
+    changes: [{ field: "image", from: "registry.local/api:v9.9.9", to: "registry.local/api:v1.4.0" }],
+  });
+  assert.equal(r.ok, false);
+  assert.ok(!r.ok && r.drift, "expected a drift verdict");
+  assert.equal(!r.ok && r.drift!.gitValue, "v1.4.0");
+  assert.equal(!r.ok && r.drift!.clusterValue, "v9.9.9");
+  assert.ok(!r.ok && /source of truth/.test(r.reason));
+  // must NOT ask for a base lookup — the key is right here, it just disagrees
+  assert.ok(!r.ok && !r.tryBase);
+});
+
+test("replica count changed in-cluster is reported as drift", () => {
+  const overlay: RepoFile = {
+    path: "apps/dev/applications/api/release.yaml",
+    content: `kind: HelmRelease
+metadata:
+  name: api
+spec:
+  values:
+    replicaCount: 2`,
+  };
+  const r = resolveGitOpsEdit([overlay], { name: "api", namespace: "flux-system" }, {
+    action: "scale",
+    changes: [{ field: "replicas", from: 7, to: 4 }],
+  });
+  assert.ok(!r.ok && r.drift && r.drift.gitValue === "2" && r.drift.clusterValue === "7");
+});
+
+test("a genuinely absent key is still 'not set' + tryBase, not drift", () => {
+  const r = resolveGitOpsEdit([overlayNoScale], HR2, { action: "scale", changes: [{ field: "replicas", from: 1, to: 3 }] });
+  assert.ok(!r.ok && !r.drift && r.tryBase);
+});
+
 // ---- base → overlay ADD (value only in base) ----
 
 const HR2 = { name: "headlamp", namespace: "flux-system" };
@@ -163,6 +217,28 @@ test("scale not in overlay but in base → ADDS replicaCount to the overlay", ()
   assert.ok(r.ok && r.addedFromBase);
   assert.ok(r.ok && /replicaCount: 3/.test(r.newContent));
   assert.ok(r.ok && r.newContent.includes("tag: v0.43.0")); // existing overlay value untouched
+});
+
+// An overlay that already sets the key to another value looks identical to "not set at all"
+// to a value-matching search. It is caught as drift before base-add is ever reached — and
+// must be, because setIn would otherwise REPLACE the operator's value while additiveDiff
+// rendered it as a clean insertion.
+test("overlay already sets the key to another value → drift, never a silent overwrite", () => {
+  const overlayWithOtherScale: RepoFile = {
+    path: "apps/dev/systems/headlamp/release.yaml",
+    content: `kind: HelmRelease
+metadata:
+  name: headlamp
+  namespace: flux-system
+spec:
+  values:
+    replicaCount: 5`,
+  };
+  const r = resolveGitOpsEdit([overlayWithOtherScale], HR2, { action: "scale", changes: [{ field: "replicas", from: 1, to: 3 }] }, [baseWithScale]);
+  assert.equal(r.ok, false);
+  assert.ok(!r.ok && r.drift && r.drift.gitValue === "5" && r.drift.clusterValue === "1");
+  // the overlay's own value survives untouched — no newContent is produced at all
+  assert.ok(!r.ok && !("newContent" in r));
 });
 
 test("resources not in overlay but in base → ADDS the nested path to the overlay", () => {

@@ -147,12 +147,18 @@ async function requestOnce(
 
   for (const tc of choice.message.tool_calls ?? []) {
     if (tc.type !== "function") continue;
-    content.push({
-      type: "tool_use",
-      id: tc.id,
-      name: tc.function.name,
-      input: JSON.parse(tc.function.arguments) as Record<string, unknown>,
-    });
+    // Small models emit malformed argument JSON regularly. An unguarded parse threw out
+    // of the whole request, so one bad tool call killed the investigation with an opaque
+    // "Unexpected token" and no hint of which tool. Keep the block (dropping it breaks
+    // tool_use/tool_result pairing) with empty args — the tool's own schema validation
+    // then tells the model what it got wrong, and it retries.
+    let input: Record<string, unknown> = {};
+    try {
+      input = JSON.parse(tc.function.arguments) as Record<string, unknown>;
+    } catch {
+      logger.warn(`Malformed tool arguments from the model for "${tc.function.name}": ${tc.function.arguments.slice(0, 200)}`);
+    }
+    content.push({ type: "tool_use", id: tc.id, name: tc.function.name, input });
   }
 
   // "length" = cut off by the token limit — surface it instead of disguising it as a clean

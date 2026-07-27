@@ -1,6 +1,7 @@
 import { resolveGitOpsEdit, deriveBasePrefix, tagOf, type RepoFile, type ChangeSpec, type ResolveResult } from "./resolve.js";
 import { GitHubClient } from "./github-client.js";
 import type { GitOpsRequest, GitOpsPayload } from "./message.js";
+import logger from "../logger.js";
 
 // GitOps op orchestration (dry_run → diff, open_pr → PR). The GitHub side is behind a
 // GitOpsBackend interface so this logic is unit-testable without network.
@@ -70,20 +71,38 @@ export async function runGitOps(req: GitOpsRequest, backend: GitOpsBackend): Pro
     const basePrefix = deriveBasePrefix(req.pathPrefix);
     if (basePrefix) resolved = resolveGitOpsEdit(files, req.helmRelease, spec, await backend.listCandidateFiles(basePrefix));
   }
-  if (!resolved.ok) return { ok: false, reason: resolved.reason };
+  if (!resolved.ok) {
+    // a refusal is a normal outcome, but "which of the N files did it look at" is the
+    // first question every time — record it once here instead of guessing later
+    logger.info(`[gitops] ${req.op} ${req.requestId} refused over ${files.length} candidate file(s): ${resolved.reason}`);
+    // drift is not a plain refusal — it is a finding the agent acts on (reconcile)
+    if (resolved.drift) {
+      logger.warn(
+        `[gitops] DRIFT ${req.helmRelease.namespace}/${req.helmRelease.name}: ${resolved.drift.valuesKey} ` +
+        `git=${resolved.drift.gitValue} cluster=${resolved.drift.clusterValue} (${resolved.drift.path})`
+      );
+      return { ok: false, reason: resolved.reason, drift: resolved.drift };
+    }
+    return { ok: false, reason: resolved.reason };
+  }
 
   if (req.op === "dry_run") {
     return { ok: true, op: "dry_run", path: resolved.path, valuesKey: resolved.valuesKey, before: resolved.before, after: resolved.after, diff: resolved.diff };
   }
 
   // open_pr: re-read the current sha (catches drift since the dry run), branch, commit the
-  // one-file change, open the PR.
+  // one-file change, open the PR. Each step is logged: this is a multi-step repo mutation,
+  // and a failure halfway (branch created, commit not) is otherwise invisible — the log is
+  // the only record of what was left behind.
   const sha = await backend.fileSha(resolved.path);
   const branch = `remediation/${slug(req.helmRelease.name)}-${req.requestId.slice(0, 8)}`;
   const title = prTitle(req);
+  logger.info(`[gitops] open_pr ${req.requestId}: ${resolved.path} (key ${resolved.valuesKey}, sha ${sha.slice(0, 7)}) → branch ${branch}`);
   await backend.createBranch(branch);
   await backend.putFile(resolved.path, resolved.newContent, sha, branch, title);
+  logger.info(`[gitops] committed ${resolved.path} on ${branch} — opening PR`);
   const prUrl = await backend.openPr(title, branch, prBody(req, resolved));
+  logger.info(`[gitops] PR opened: ${prUrl}`);
   return { ok: true, op: "open_pr", path: resolved.path, prUrl };
 }
 
