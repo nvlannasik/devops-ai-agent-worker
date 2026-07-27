@@ -17,7 +17,9 @@ architecture and design decisions.
 - TypeScript ESM (NodeNext). Test files `*.test.ts` excluded from the build.
 
 ## Gotchas (see MEMORY_BANK.md for the full list)
-- **Message contract is shared with the agent:** request `{ requestId, messages, tools, systemPrompt }` → response `{ requestId, response | error }`. Changing this shape must be coordinated with `devops-ai-agent`'s `SQSLLMClient`.
+- **Message contract is shared with the agent:** request `{ requestId, messages, tools, systemPrompt, traceId? }` → response `{ requestId, response | error }`. Changing this shape must be coordinated with `devops-ai-agent`'s `SQSLLMClient`. `traceId` (the agent's Slack threadId) is logging-only and optional.
+- **`toOpenAIMessages` (`llm.ts`) must stay in sync** with the agent's `openai-compatible.ts` copy. Never flatten content blocks with `JSON.stringify` — a small model imitates the JSON it sees and answers with it instead of calling a tool.
+- **The backend needs its tool-call parser on** (vLLM: `--enable-auto-tool-choice --tool-call-parser <parser>`), or no `tool_calls` are ever returned.
 - **Response queue is shared** across agent replicas; the agent routes by `requestId`. The worker just publishes the response with its `requestId` — don't assume a dedicated per-agent queue.
 - **FIFO queues:** `MessageGroupId` / `MessageDeduplicationId` = `requestId`.
 - Talks to the private LLM over an **OpenAI-compatible** API.

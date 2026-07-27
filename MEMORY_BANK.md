@@ -75,6 +75,28 @@ connects directly and times out (curl works, Node doesn't — classic symptom).
 - **Auto-retry safeguard:** `isEmptyTokenExhaustion()` (unit-tested) — empty content + `max_tokens` means the model spent the ENTIRE budget on hidden thinking; retry once with **2× the token budget**. Partial answers are never retried; one retry max. Frequent `warn` retries = raise `LLM_MAX_TOKENS` (16384 recommended for reasoning models; thinking counts toward the limit).
 - Agent-side `SQS_LLM_TIMEOUT_SECONDS` must cover attempt + retry (agent default now 240s — 120s once lost the race by 23s).
 
+### Anthropic-shaped history → OpenAI chat (`toOpenAIMessages`, `llm.ts`)
+The agent speaks Anthropic-style content blocks (`{type:"tool_use"|"tool_result"|"text"}`);
+the private LLM speaks OpenAI chat. `toOpenAIMessages()` translates: `tool_use` →
+`assistant.tool_calls[]`, `tool_result` → a `role:"tool"` message with `tool_call_id`, text
+blocks joined. Tool results are emitted **before** any new user text in the same turn —
+OpenAI requires every tool message to directly follow the assistant turn that requested it.
+- **This used to be `JSON.stringify(m.content)`.** The literal `[{"type":"tool_use",...}]`
+  went into the prompt as TEXT. A large model ignores the noise; a small one **imitates it**
+  and answers with that JSON instead of calling a tool. The agent then posted the raw array
+  to Slack and re-stringified it next turn, so each round added a layer of escaping.
+  Symptom: nested `[{\"type\":\"text\",\"text\":\"[{\\\"type\\\"...` walls in Slack, and
+  `chatcmpl-tool-<id>` values that repeat across turns (the model copying an id it saw).
+- The identical bug existed in the agent's own `openai-compatible.ts` (direct-HTTP path).
+  Both are fixed; the two copies must stay in sync (separate repos, no shared module).
+- **Backend requirement:** vLLM & friends only emit `tool_calls` with
+  `--enable-auto-tool-choice --tool-call-parser <hermes|llama3_json|mistral|...>`. Without
+  it the symptom returns even though the code is correct.
+- Malformed tool-call arguments (common with small models) no longer throw out of the whole
+  request: the `tool_use` block is kept with `input: {}` (dropping it would break
+  tool_use/tool_result pairing) and a warning logs the raw arguments. The tool's own schema
+  validation then tells the model what it got wrong.
+
 ### DLQ Flow
 On LLM error:
 1. Original request forwarded to DLQ
@@ -101,6 +123,7 @@ On LLM error:
 ### SQSClient timeouts
 - Created with `requestHandler: { connectionTimeout: 5000, requestTimeout: (pollWaitSeconds + 15)s }` + `maxAttempts: 3`. Without a timeout a hung SQS call freezes the poll loop. `requestTimeout` must exceed the long-poll wait.
 - `processMessage` logs `Replied requestId=...` **after** the response is published. The earlier `Done requestId=...` only means the LLM finished — the publish (which the agent actually waits on) happens after, so a crash between the two looks like success in the logs.
+- **Publish BEFORE delete, sequentially** (was `Promise.all([send, delete])`). Run concurrently, a failed publish could still pair with a successful delete: the request is gone, no reply ever arrives, and the agent blocks to timeout with nothing in either log explaining it. Publish-first means a delete failure only costs a redelivery — a duplicate LLM call whose duplicate reply the agent's tombstone drops. Duplicate work beats a lost reply.
 
 ### Graceful Shutdown
 - `AbortController` signal → loop breaks, then `await Promise.allSettled(inFlight)` **drains** remaining in-flight LLM calls so their responses are still published (agents aren't left waiting).
@@ -113,6 +136,9 @@ here, like the private LLM). Step 2 shipped the building blocks (no live SQS han
 - **`github-app.ts`** — GitHub App auth hand-rolled with `node:crypto` (no `@octokit` dep): `buildAppJwt` (RS256 JWT, iss=appId, exp ≤10min) → `getInstallationToken` (exchange for a ≤1h token). Unit-tested with a real generated keypair (sign + verify). Unused when a PAT is set.
 - **`github-client.ts`** — thin REST client over `fetch` (configurable `apiUrl` for GHE): `listYamlFiles` (recursive tree), `getFile`, `createBranch`, `putFile` (contents API — no clone), `openPr`. `token()` returns the PAT directly when set, else the cached App installation token (~1min-before-expiry refresh). `fetch` injectable for tests (PAT path unit-tested: skips the App exchange).
 - **`resolve.ts`** — locate + edit, **line-based, NO yaml dependency** (targeted one-line edit → minimal diff, comments preserved; a parse+reserialize would rewrite the whole file). `resolveGitOpsEdit(files, helmRelease, changeSpec)`: find the HelmRelease file (`kind: HelmRelease` + matching `name:`), edit the value line(s), return `{path, valuesKey, before, after, newContent, diff}`. Per action: **set_image** (`tag`/`image` via `tagOf`), **scale** (`replicaCount`/`replicas`) — single scalar; **set_resources** (`resolveResourceEdit`) — nested `resources.{requests,limits}.{cpu,memory}` leaves located via an indentation-tracked parent stack (disambiguates `limits.memory` from `requests.memory`), supports multiple changes → multi-hunk diff. Refuses (honest) on: HR file missing/ambiguous, >1 matching line, or two changes hitting the same line. **Base→overlay ADD:** when the value isn't in the overlay (`tryBase`), the worker derives the base prefix (`deriveBasePrefix`: `apps/dev/systems`→`apps/base/systems`), fetches the base HR, learns the value's path by KEY (`findKeyPaths`), and ADDS it to the overlay's `spec.values` via the **`yaml` Document API** (`setIn` — creates the nested key, preserves the rest) — overriding base per-env, so a remediation isn't refused just because the value wasn't overridden in the overlay yet. Safe: path copied from base, never guessed. Scope: scale + resources (image tags ~always in overlays). `yaml` is the ONE dep here — in-overlay edits stay line-based (minimal diff). **Component disambiguation:** for multi-component charts (`controller.replicaCount` + `proxy.replicaCount`), the request carries `component` (the workload's `app.kubernetes.io/component` label, from the MCP guard); `narrowByComponent` keeps only the path whose ancestors include that component. Fail-safe — if it doesn't narrow to exactly one, refuses (never guesses). `// ponytail:` resources isn't container-scoped; component is label-only (no name-based fallback yet).
+- **Cluster/GitOps drift detection (`detectDrift` in `resolve.ts`).** The line search matches key AND value, so "the overlay doesn't set this key" and "the overlay sets it to a *different* value" were indistinguishable — both fell through to the base-add path and surfaced as *"the value is not set in the overlay and can't be auto-added for this action"*. That message is wrong whenever somebody changed the cluster directly (`kubectl set image`): the incident context's `from` is the DRIFTED cluster value, which of course isn't in Git. Now, when the value search finds nothing, `findKeyLines` re-scans by KEY alone; exactly one hit with a different value ⇒ **drift**, returned as `{ok:false, reason, drift:{path, valuesKey, gitValue, clusterValue}}` and logged `DRIFT ... git=X cluster=Y`. Drift is checked BEFORE `tryBase` (the key is right here, it just disagrees) and it is NOT a plain refusal — the agent turns it into a `flux_reconcile` proposal, because the repo is the source of truth. Ambiguous matches stay undefined and fall back to the old message (never guesses). Covers set_image, scale, set_resources.
+- **`addFromBase` refuses when `doc.hasIn(path)` is already true** — backstop for the drift cases `detectDrift` can't decide. `setIn` would otherwise REPLACE the operator's value while `additiveDiff` rendered it as a clean insertion, i.e. a human approving a diff that hides an overwrite. `additiveDiff` now also reports leftover original lines as removals rather than dropping them.
+- **`listYamlFiles` throws on a truncated tree.** GitHub silently truncates a `recursive=1` tree past ~100k entries / 7MB and sets `truncated: true`. Ignoring it made missing files look nonexistent → "value not found in the overlay", a wrong answer with no error anywhere.
 - Config: `config.gitops` (enabled when `GITHUB_APP_ID` + `GITOPS_REPO` set); private key from `GITHUB_APP_PRIVATE_KEY` or `_FILE`.
 - **`message.ts`** — SQS contract (agent → worker): `{requestId, op:"dry_run"|"open_pr", helmRelease:{name,namespace}, action, container?, changes:[{field,from,to}], pathPrefix?, incident?}` → `{requestId, response: GitOpsPayload | error}`. `repo`/`branch` are NOT in the message (worker owns them = single-repo blast radius). `pathPrefix` IS in the message — the agent auto-detects the per-env overlay from the Flux Kustomization `spec.path` and sends it; `listCandidateFiles(pathPrefix ?? config.pathPrefix)` scopes the file search to it (falls back to `GITOPS_PATH_PREFIX`). `parseGitOpsRequest` validates (trust boundary), unit-tested.
 - **`handler.ts`** — `runGitOps(req, backend)`: locate+resolve → dry_run returns the diff, open_pr re-reads the sha (catches drift), branches, commits the one file, opens the PR. GitHub side behind a `GitOpsBackend` interface (unit-tested with a fake). `githubBackend` narrows to release-like YAML (`mapLimit` bounded fetch) then falls back to all. `prTitle`/`prBody` (exported, tested) build a short action-specific title (`Remediation: bump \`x\` image to v2`) + a clean body (workload/file, change table, collapsible diff, provenance) from the structured change — NOT the agent's verbose card summary.
@@ -163,13 +189,24 @@ here, like the private LLM). Step 2 shipped the building blocks (no live SQS han
 - Published with `MessageGroupId=requestId`, `MessageDeduplicationId=requestId`
 - Worker publishes response to the shared `SQS_RESPONSE_QUEUE_NAME` with the same `requestId` in the body
 - **Multi-replica routing lives on the agent side:** the agent runs one dispatcher per replica over the shared response queue and releases (`ChangeMessageVisibility`) any message that isn't its own so the owning replica can grab it. The worker stays simple — it always replies to the one shared response queue.
+- **`traceId` (optional, logging only)** — the agent's Slack `threadId`, carried on the request
+  and echoed in every worker log line for that message. `requestId` correlates the two
+  processes; `traceId` correlates them to the **Slack thread a human is looking at**, so one
+  grep spans all three. Agent-side it comes from an `AsyncLocalStorage` set in `investigate()`
+  (no `LLMClient.chat()` signature change for a logging concern). Absent on older agents —
+  never required, never used for routing.
+  ```
+  agent : [sqs-llm] → requestId=abc-123 trace=1785135868.123 msgs=7 tools=24 awaiting=2
+  worker: Processing requestId=abc-123 trace=1785135868.123 msgs=7 tools=24
+  worker: Done requestId=abc-123 trace=... 8241ms stop=tool_use content=[text,tool_use] in=12043 out=87
+  ```
 
 ## File Structure
 ```
 src/
 ├── config.ts    # All config from env vars
-├── llm.ts       # OpenAI-compatible LLM caller, optional params
-├── logger.ts    # Winston, LOG_LEVEL support
+├── llm.ts       # OpenAI-compatible LLM caller, toOpenAIMessages(), optional params
+├── logger.ts    # Winston, LOG_LEVEL support, errDetail() (stack-preserving)
 ├── sqs.ts       # resolveQueueUrl() with auto-create, ensureRedrivePolicy()
 ├── message.ts   # parseSqsRequest() — body parse + validation (poison-pill guard)
 ├── types.ts     # SQSRequest, SQSResponse, LLMResponse, Message
@@ -180,11 +217,16 @@ index.ts         # Entry point + graceful shutdown
 ## Testing
 - `npm test` → `node --import tsx --test 'src/**/*.test.ts'` (Node >= 24 built-in runner + tsx, zero new deps)
 - `*.test.ts` excluded from the `tsc` build so `dist/` stays clean
-- Covered so far: `parseSqsRequest` (poison-pill validation)
+- Covered so far: `parseSqsRequest` (poison-pill validation), `toOpenAIMessages` (tool round-trip + tool-before-user ordering), `isEmptyTokenExhaustion`, `parseSocksProxy`/`buildSocksFetch`, gitops `resolve` incl. drift + base-add, `parseGitOpsRequest`, `prTitle`/`prBody`, GitHub App JWT
 
 ## Known Issues Fixed
 - `max_tokens` → some models require `max_completion_tokens` instead: `LLM_USE_MAX_COMPLETION_TOKENS=true`
 - `top_p` unsupported by some models: leave `LLM_TOP_P` unset
+- **Content blocks reached the model as stringified JSON** — see `toOpenAIMessages` above. The single biggest cause of garbled Slack output with a small private LLM.
+- **Malformed tool-call arguments killed the whole request** with an opaque `Unexpected token` naming no tool.
+- **Lost replies from `Promise.all([send, delete])`** — now publish-then-delete.
+- **A truncated GitHub tree looked like "file not found"** — now an explicit error.
+- **Errors logged without stacks** — `errDetail()` in `logger.ts` replaces `${err}` (which prints only `Error: message`) on every hot path.
 
 ## AWS Authentication
 
