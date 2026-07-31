@@ -1,33 +1,9 @@
 import OpenAI from "openai";
-import { Agent, fetch as undiciFetch } from "undici";
-import { socksConnector } from "fetch-socks";
 import { config } from "./config.js";
+import { proxiedFetch } from "./socks.js";
+import { anthropicRequest } from "./anthropic.js";
 import logger from "./logger.js";
 import type { LLMResponse, Message, ToolDefinition, ContentBlock } from "./types.js";
-
-// Parse a SOCKS proxy URL (socks5://[user:pass@]host:port; socks4:// → type 4) into the
-// shape fetch-socks wants. Returns null for empty/invalid input (→ direct connection).
-// Exported for unit tests.
-export function parseSocksProxy(url: string): { type: 4 | 5; host: string; port: number; userId?: string; password?: string } | null {
-  if (!url) return null;
-  let u: URL;
-  try {
-    u = new URL(url);
-  } catch {
-    return null;
-  }
-  if (!u.hostname) return null;
-  const type = u.protocol === "socks4:" || u.protocol === "socks4a:" ? 4 : 5;
-  return {
-    type,
-    host: u.hostname,
-    port: Number(u.port) || 1080,
-    ...(u.username ? { userId: decodeURIComponent(u.username) } : {}),
-    ...(u.password ? { password: decodeURIComponent(u.password) } : {}),
-  };
-}
-
-export type SocksProxyCfg = NonNullable<ReturnType<typeof parseSocksProxy>>;
 
 // The agent speaks Anthropic-shaped content blocks; the private LLM speaks OpenAI chat.
 // This used to be `JSON.stringify(m.content)` — which put the literal
@@ -68,25 +44,23 @@ export function toOpenAIMessages(messages: Message[]): OpenAI.Chat.ChatCompletio
   return out;
 }
 
-// A fetch that dials through the SOCKS proxy. Uses undici's OWN fetch + Agent (not Node's
-// global fetch): the connector's dispatcher must come from the SAME undici that runs the
-// request, or the handler interfaces mismatch (UND_ERR_INVALID_ARG onRequestStart). TLS/SNI
-// to the real host is preserved by the connector, so no /etc/hosts trick is needed.
-// Exported for tests. Returns a fetch typed as the global one for the OpenAI SDK.
-export function buildSocksFetch(proxy: SocksProxyCfg): typeof fetch {
-  const agent = new Agent({ connect: socksConnector({ type: proxy.type, host: proxy.host, port: proxy.port, userId: proxy.userId, password: proxy.password }) });
-  const f = (input: string | URL, init?: Record<string, unknown>) => undiciFetch(input, { ...init, dispatcher: agent });
-  return f as unknown as typeof fetch;
-}
-
 function buildClient(): OpenAI {
-  const proxy = parseSocksProxy(config.llm.socksProxy);
-  if (!proxy) return new OpenAI({ baseURL: config.llm.baseUrl, apiKey: config.llm.apiKey });
-  logger.info(`[llm] routing LLM API through SOCKS${proxy.type} proxy ${proxy.host}:${proxy.port}`);
-  return new OpenAI({ baseURL: config.llm.baseUrl, apiKey: config.llm.apiKey, fetch: buildSocksFetch(proxy) });
+  const f = proxiedFetch(config.llm.socksProxy);
+  return new OpenAI({ baseURL: config.llm.baseUrl, apiKey: config.llm.apiKey, ...(f && { fetch: f }) });
 }
 
-const client = buildClient();
+// only the OpenAI path needs a client object; the Anthropic path is a plain fetch
+const client = config.llm.apiFormat === "openai" ? buildClient() : null;
+
+// Called once at worker startup so a typo'd LLM_API_FORMAT stops the pod instead of failing
+// the first alert of the day — the same rule the agent's backend registry follows.
+export function assertApiFormat(): void {
+  const f = config.llm.apiFormat;
+  if (f !== "openai" && f !== "anthropic") {
+    throw new Error(`LLM_API_FORMAT="${f}" is not a known format (openai, anthropic)`);
+  }
+  logger.info(`[llm] API format: ${f}, model ${config.llm.model}`);
+}
 
 // Reasoning models can spend the ENTIRE output budget on hidden thinking and return no
 // content at all (finish_reason=length, empty message). That specific failure gets one
@@ -115,11 +89,17 @@ async function requestOnce(
   systemPrompt: string,
   maxTokens: number
 ): Promise<LLMResponse> {
+  // Only the request/response shape differs per format. Everything around it — the
+  // token-exhaustion retry above, the SQS envelope, the visibility extender — is shared.
+  if (config.llm.apiFormat === "anthropic") {
+    return anthropicRequest(messages, tools, systemPrompt, maxTokens);
+  }
+
   const tokenParam = config.llm.useMaxCompletionTokens
     ? { max_completion_tokens: maxTokens }
     : { max_tokens: maxTokens };
 
-  const response = await client.chat.completions.create({
+  const response = await client!.chat.completions.create({
     model: config.llm.model,
     ...tokenParam,
     ...(config.llm.reasoningEffort && { reasoning_effort: config.llm.reasoningEffort }),

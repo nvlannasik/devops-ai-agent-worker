@@ -9,7 +9,7 @@ import { randomUUID } from "crypto";
 import { config } from "./config.js";
 import { resolveQueueUrl, ensureRedrivePolicy } from "./sqs.js";
 import { parseSqsRequest } from "./message.js";
-import { callLLM } from "./llm.js";
+import { callLLM, assertApiFormat } from "./llm.js";
 import logger, { errDetail } from "./logger.js";
 import type { SQSResponse } from "./types.js";
 import { parseGitOpsRequest, type GitOpsResponse } from "./gitops/message.js";
@@ -243,6 +243,8 @@ async function pollLoop(
 }
 
 export async function startWorker(signal: AbortSignal): Promise<void> {
+  // before touching SQS: a bad LLM_API_FORMAT must fail the pod at boot, not the first request
+  assertApiFormat();
   const queues = await resolveQueues();
   const maxConcurrency = config.sqs.maxConcurrency;
 

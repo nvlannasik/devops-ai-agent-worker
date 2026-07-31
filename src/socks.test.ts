@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
 import http from "node:http";
-import { parseSocksProxy, buildSocksFetch } from "./llm.js";
+import { parseSocksProxy, buildSocksFetch } from "./socks.js";
 
 test("parseSocksProxy parses url, auth, socks4/5, and rejects junk", () => {
   assert.deepEqual(parseSocksProxy("socks5://127.0.0.1:1080"), { type: 5, host: "127.0.0.1", port: 1080 });

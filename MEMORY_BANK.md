@@ -75,6 +75,37 @@ connects directly and times out (curl works, Node doesn't — classic symptom).
 - **Auto-retry safeguard:** `isEmptyTokenExhaustion()` (unit-tested) — empty content + `max_tokens` means the model spent the ENTIRE budget on hidden thinking; retry once with **2× the token budget**. Partial answers are never retried; one retry max. Frequent `warn` retries = raise `LLM_MAX_TOKENS` (16384 recommended for reasoning models; thinking counts toward the limit).
 - Agent-side `SQS_LLM_TIMEOUT_SECONDS` must cover attempt + retry (agent default now 240s — 120s once lost the race by 23s).
 
+### Backend wire format (`LLM_API_FORMAT`, `llm.ts` + `anthropic.ts`)
+The flag names the **wire format, not the model vendor**: `openai` (default) is
+`POST /v1/chat/completions` — vLLM, Ollama, SGLang, most gateways — and `anthropic` is
+`POST /v1/messages`. Default preserves every existing deployment.
+
+The asymmetry is the point: **the Anthropic path has no translation layer at all.** The agent's
+wire format already *is* Anthropic's — `ContentBlock` is `{type:"tool_use", id, name, input}` /
+`{type:"tool_result", tool_use_id, content}`, and `stopReason` is the exact
+`end_turn | tool_use | max_tokens` union. `toOpenAIMessages` exists precisely because the OpenAI
+path speaks a different shape. So `anthropic.ts` only re-keys: blocks are rebuilt field-by-field
+(never spread — `ContentBlock` is one loose union, and the API 400s on keys foreign to a block
+type), `systemPrompt` becomes a top-level `system` parameter rather than a message, and tools use
+`input_schema` with no `{type:"function", function:{…}}` envelope.
+
+- **No new dependency.** It is one POST, so it uses `fetch` and reuses `buildSocksFetch` from
+  `socks.ts` — the Anthropic SDK would be a dependency for what fits in one file.
+- `parseSocksProxy`/`buildSocksFetch` moved `llm.ts` → `socks.ts` so both paths share one proxy
+  decision (and its single startup log line) without a circular import.
+- Only the request/response shape differs. The token-exhaustion retry, the SQS envelope, and the
+  visibility extender are shared and format-agnostic.
+- **Not forwarded on this path:** `LLM_SEED`, `LLM_REASONING_EFFORT`, `LLM_USE_MAX_COMPLETION_TOKENS`
+  — none exist in the Messages API (thinking is a `thinking` budget object), and an unknown
+  top-level field is a 400.
+- `cacheReadTokens`/`cacheCreationTokens` are real numbers here; the OpenAI path hardcodes them to 0.
+- `assertApiFormat()` runs at the top of `startWorker()`, so a typo'd format fails the pod at boot
+  rather than the first alert of the day — same rule as the agent's backend registry. It is called
+  there and not at config import so the failure lands inside `index.ts`'s `.catch` and gets a clean
+  logged exit instead of a raw unhandled rejection.
+- **Bedrock is a third format, not this one.** It speaks the same message shape but needs SigV4 and
+  `/model/<id>/invoke`; adding it means a new `apiFormat` value, not a tweak here.
+
 ### Anthropic-shaped history → OpenAI chat (`toOpenAIMessages`, `llm.ts`)
 The agent speaks Anthropic-style content blocks (`{type:"tool_use"|"tool_result"|"text"}`);
 the private LLM speaks OpenAI chat. `toOpenAIMessages()` translates: `tool_use` →
@@ -156,14 +187,15 @@ here, like the private LLM). Step 2 shipped the building blocks (no live SQS han
 | `SQS_MAX_MESSAGES` | Max messages per poll batch | `5` |
 | `SQS_MAX_CONCURRENCY` | Max messages processed concurrently | `10` |
 | `SQS_MAX_RECEIVE_COUNT` | Receives before SQS dead-letters a message | `3` |
-| `LLM_BASE_URL` | Private LLM base URL | required |
-| `LLM_API_KEY` | API key (`none` if not needed) | `none` |
+| `LLM_API_FORMAT` | Backend wire format: `openai` \| `anthropic` | `openai` |
+| `LLM_BASE_URL` | Private LLM base URL (trailing `/v1` optional for `anthropic`) | required |
+| `LLM_API_KEY` | API key (`none` if not needed) — `Bearer` on openai, `x-api-key` on anthropic | `none` |
 | `LLM_MODEL` | Model name | required |
 | `LLM_MAX_TOKENS` | Max output tokens | `8096` |
-| `LLM_USE_MAX_COMPLETION_TOKENS` | Use `max_completion_tokens` param | `false` |
+| `LLM_USE_MAX_COMPLETION_TOKENS` | Use `max_completion_tokens` param (openai only) | `false` |
 | `LLM_TEMPERATURE` | Optional inference param | — |
 | `LLM_TOP_P` | Optional inference param | — |
-| `LLM_SEED` | Optional inference param | — |
+| `LLM_SEED` | Optional inference param (openai only) | — |
 | `LOG_LEVEL` | `error\|warn\|info\|debug` | `debug` (dev), `info` (prod) |
 | `AWS_ACCESS_KEY_ID` | Local dev only — use IRSA on EKS | — |
 | `AWS_SECRET_ACCESS_KEY` | Local dev only — use IRSA on EKS | — |
@@ -205,7 +237,9 @@ here, like the private LLM). Step 2 shipped the building blocks (no live SQS han
 ```
 src/
 ├── config.ts    # All config from env vars
-├── llm.ts       # OpenAI-compatible LLM caller, toOpenAIMessages(), optional params
+├── llm.ts       # Format dispatch + shared retry; OpenAI path, toOpenAIMessages()
+├── anthropic.ts # Messages API path (/v1/messages) — no translation layer needed
+├── socks.ts     # parseSocksProxy(), buildSocksFetch(), proxiedFetch() — shared by both paths
 ├── logger.ts    # Winston, LOG_LEVEL support, errDetail() (stack-preserving)
 ├── sqs.ts       # resolveQueueUrl() with auto-create, ensureRedrivePolicy()
 ├── message.ts   # parseSqsRequest() — body parse + validation (poison-pill guard)
@@ -218,6 +252,11 @@ index.ts         # Entry point + graceful shutdown
 - `npm test` → `node --import tsx --test 'src/**/*.test.ts'` (Node >= 24 built-in runner + tsx, zero new deps)
 - `*.test.ts` excluded from the `tsc` build so `dist/` stays clean
 - Covered so far: `parseSqsRequest` (poison-pill validation), `toOpenAIMessages` (tool round-trip + tool-before-user ordering), `isEmptyTokenExhaustion`, `parseSocksProxy`/`buildSocksFetch`, gitops `resolve` incl. drift + base-add, `parseGitOpsRequest`, `prTitle`/`prBody`, GitHub App JWT
+- Anthropic path: `toAnthropicContent`/`fromAnthropicResponse`/`messagesEndpoint` as pure functions
+  (`anthropic.test.ts`), plus `anthropic.request.test.ts` — a stub HTTP server asserting the actual
+  wire shape (`/v1/messages`, `x-api-key`, `anthropic-version`, top-level `system`, `input_schema`,
+  no `Authorization`). That file sets env **before** a dynamic import, since config is read at
+  module load; node:test gives each file its own process, so it affects nothing else.
 
 ## Known Issues Fixed
 - `max_tokens` → some models require `max_completion_tokens` instead: `LLM_USE_MAX_COMPLETION_TOKENS=true`

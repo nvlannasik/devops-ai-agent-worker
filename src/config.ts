@@ -25,7 +25,12 @@ export const config = {
     maxReceiveCount: parseInt(process.env.SQS_MAX_RECEIVE_COUNT ?? "3"),
   },
   llm: {
+    // Wire format of the backend, NOT the model vendor: "openai" = /v1/chat/completions
+    // (vLLM, Ollama, SGLang, most gateways), "anthropic" = /v1/messages. Default keeps every
+    // existing deployment on the path it already used. Validated at boot by assertApiFormat().
+    apiFormat: (process.env.LLM_API_FORMAT ?? "openai") as "openai" | "anthropic",
     baseUrl: process.env.LLM_BASE_URL!,
+    // sent as `Authorization: Bearer` (openai) or `x-api-key` (anthropic)
     apiKey: process.env.LLM_API_KEY ?? "none",
     // Optional SOCKS proxy for the LLM API only (e.g. socks5://127.0.0.1:1080). Node's
     // fetch/undici has no SOCKS support and ignores ALL_PROXY, so a tunnel that curl reaches
