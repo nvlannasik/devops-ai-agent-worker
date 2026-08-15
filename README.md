@@ -52,7 +52,7 @@ npm test                       # unit tests
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `SQS_REGION` | AWS region | `ap-southeast-1` |
+| `AWS_REGION` | AWS region | `ap-southeast-1` |
 | `SQS_REQUEST_QUEUE_NAME` | FIFO queue for requests | `llm-request.fifo` |
 | `SQS_RESPONSE_QUEUE_NAME` | FIFO queue for responses | `llm-response.fifo` |
 | `SQS_REQUEST_DLQ_NAME` | FIFO dead-letter queue | `llm-request-dlq.fifo` |
@@ -62,6 +62,7 @@ npm test                       # unit tests
 | `SQS_VISIBILITY_TIMEOUT_SECONDS` | Request queue visibility timeout — must exceed max LLM inference time | `300` |
 | `SQS_MAX_RECEIVE_COUNT` | Receives before SQS moves a message to the DLQ (RedrivePolicy) | `3` |
 | `LLM_BASE_URL` | Private LLM base URL | required |
+| `LLM_API_FORMAT` | Wire format, not vendor: `openai` (`/v1/chat/completions`) or `anthropic` (`/v1/messages`). The Anthropic path needs no message translation — the agent's blocks already are Anthropic blocks. `LLM_SEED` / `LLM_REASONING_EFFORT` / `LLM_USE_MAX_COMPLETION_TOKENS` are **openai-only** and 400 on `/v1/messages` | `openai` |
 | `LLM_API_KEY` | API key (`none` if not needed) | `none` |
 | `LLM_SOCKS_PROXY` | Optional SOCKS proxy for the LLM API only, e.g. `socks5://127.0.0.1:1080`. Unset = direct connection. See **SOCKS proxy** below | — |
 | `LLM_MODEL` | Model name | required |
@@ -164,7 +165,7 @@ Required IAM permissions (attach to instance role or IRSA):
 docker build -t llm-worker .
 
 docker run \
-  -e SQS_REGION=ap-southeast-1 \
+  -e AWS_REGION=ap-southeast-1 \
   -e SQS_REQUEST_QUEUE_NAME=llm-request.fifo \
   -e SQS_RESPONSE_QUEUE_NAME=llm-response.fifo \
   -e LLM_BASE_URL=http://your-llm:8080/v1 \
