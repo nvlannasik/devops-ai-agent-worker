@@ -273,7 +273,7 @@ Controlled by `AWS_AUTH_MODE` env var (read by `entrypoint.sh`):
 
 | Mode | Setup | Use case |
 |------|-------|----------|
-| `iam-anywhere` | Writes `~/.aws/config` with `credential_process` | On-premise / private network with X.509 cert |
+| `iam-anywhere` | Writes `$AWS_CONFIG_FILE` (default `/tmp/aws/config`) with `credential_process` | On-premise / private network with X.509 cert |
 | `irsa` | No setup needed | EKS with IRSA |
 | `env` | No setup needed | Local dev (`AWS_ACCESS_KEY_ID`/`SECRET`) |
 | `instance-profile` | No setup needed | EC2 instance metadata |
