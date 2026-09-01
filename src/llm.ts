@@ -2,6 +2,7 @@ import OpenAI from "openai";
 import { config } from "./config.js";
 import { proxiedFetch } from "./socks.js";
 import { anthropicRequest } from "./anthropic.js";
+import { agentBuilderRequest } from "./agent-builder.js";
 import logger from "./logger.js";
 import type { LLMResponse, Message, ToolDefinition, ContentBlock } from "./types.js";
 
@@ -56,8 +57,8 @@ const client = config.llm.apiFormat === "openai" ? buildClient() : null;
 // the first alert of the day — the same rule the agent's backend registry follows.
 export function assertApiFormat(): void {
   const f = config.llm.apiFormat;
-  if (f !== "openai" && f !== "anthropic") {
-    throw new Error(`LLM_API_FORMAT="${f}" is not a known format (openai, anthropic)`);
+  if (f !== "openai" && f !== "anthropic" && f !== "agent-builder") {
+    throw new Error(`LLM_API_FORMAT="${f}" is not a known format (openai, anthropic, agent-builder)`);
   }
   logger.info(`[llm] API format: ${f}, model ${config.llm.model}`);
 }
@@ -72,27 +73,36 @@ export function isEmptyTokenExhaustion(res: LLMResponse): boolean {
 export async function callLLM(
   messages: Message[],
   tools: ToolDefinition[],
-  systemPrompt: string
+  systemPrompt: string,
+  traceId?: string
 ): Promise<LLMResponse> {
-  const first = await requestOnce(messages, tools, systemPrompt, config.llm.maxTokens);
+  const first = await requestOnce(messages, tools, systemPrompt, config.llm.maxTokens, traceId);
   if (!isEmptyTokenExhaustion(first)) return first;
 
   logger.warn(
     `Empty response: reasoning consumed the whole ${config.llm.maxTokens}-token budget — retrying once with 2x`
   );
-  return requestOnce(messages, tools, systemPrompt, config.llm.maxTokens * 2);
+  return requestOnce(messages, tools, systemPrompt, config.llm.maxTokens * 2, traceId);
 }
 
 async function requestOnce(
   messages: Message[],
   tools: ToolDefinition[],
   systemPrompt: string,
-  maxTokens: number
+  maxTokens: number,
+  traceId?: string
 ): Promise<LLMResponse> {
   // Only the request/response shape differs per format. Everything around it — the
   // token-exhaustion retry above, the SQS envelope, the visibility extender — is shared.
   if (config.llm.apiFormat === "anthropic") {
     return anthropicRequest(messages, tools, systemPrompt, maxTokens);
+  }
+
+  // maxTokens has nowhere to go on this path: the Langflow envelope carries no token budget,
+  // so the output cap lives in the flow's own model component. The retry above is therefore
+  // dead code here — agent-builder never reports a max_tokens stop reason to trigger it.
+  if (config.llm.apiFormat === "agent-builder") {
+    return agentBuilderRequest(messages, tools, systemPrompt, traceId);
   }
 
   const tokenParam = config.llm.useMaxCompletionTokens

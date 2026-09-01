@@ -61,9 +61,9 @@ npm test                       # unit tests
 | `SQS_MAX_CONCURRENCY` | Max messages processed concurrently (poll loop never blocks on a slow LLM call) | `10` |
 | `SQS_VISIBILITY_TIMEOUT_SECONDS` | Request queue visibility timeout — must exceed max LLM inference time | `300` |
 | `SQS_MAX_RECEIVE_COUNT` | Receives before SQS moves a message to the DLQ (RedrivePolicy) | `3` |
-| `LLM_BASE_URL` | Private LLM base URL | required |
-| `LLM_API_FORMAT` | Wire format, not vendor: `openai` (`/v1/chat/completions`) or `anthropic` (`/v1/messages`). The Anthropic path needs no message translation — the agent's blocks already are Anthropic blocks. `LLM_SEED` / `LLM_REASONING_EFFORT` / `LLM_USE_MAX_COMPLETION_TOKENS` are **openai-only** and 400 on `/v1/messages` | `openai` |
-| `LLM_API_KEY` | API key (`none` if not needed) | `none` |
+| `LLM_BASE_URL` | Private LLM base URL. On `agent-builder` it is the **full run endpoint**, `https://<host>/api/v1/run/<flow-id>` | required |
+| `LLM_API_FORMAT` | Wire format, not vendor: `openai` (`/v1/chat/completions`), `anthropic` (`/v1/messages`), or `agent-builder` (Langflow run endpoint). The Anthropic path needs no message translation — the agent's blocks already are Anthropic blocks. `LLM_SEED` / `LLM_REASONING_EFFORT` / `LLM_USE_MAX_COMPLETION_TOKENS` are **openai-only** and 400 on `/v1/messages`; on `agent-builder`, `LLM_MODEL` and `LLM_MAX_TOKENS` are inert too — both live in the flow | `openai` |
+| `LLM_API_KEY` | API key (`none` if not needed) — sent as `x-api-key` on `anthropic` and `agent-builder` | `none` |
 | `LLM_SOCKS_PROXY` | Optional SOCKS proxy for the LLM API only, e.g. `socks5://127.0.0.1:1080`. Unset = direct connection. See **SOCKS proxy** below | — |
 | `LLM_MODEL` | Model name | required |
 | `LLM_MAX_TOKENS` | Max output tokens. **Reasoning models:** hidden thinking counts toward this — use `16384`+ so thinking + answer fit | `8096` |

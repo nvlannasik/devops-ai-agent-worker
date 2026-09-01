@@ -117,7 +117,10 @@ async function processMessage(body: string, receiptHandle: string, queues: Queue
   const started = Date.now();
   let response: SQSResponse;
   try {
-    const llmResponse = await callLLM(req.messages, req.tools, req.systemPrompt);
+    // traceId reaches the LLM call only so the agent-builder path can send it as session_id —
+    // that puts the Slack threadId in the platform's own logs too, extending the one-grep join
+    // this worker already gives the agent log and the thread.
+    const llmResponse = await callLLM(req.messages, req.tools, req.systemPrompt, req.traceId);
     response = { requestId: req.requestId, response: llmResponse };
     const blocks = llmResponse.content.map((c) => c.type).join(",") || "empty";
     logger.info(

@@ -75,10 +75,11 @@ connects directly and times out (curl works, Node doesn't — classic symptom).
 - **Auto-retry safeguard:** `isEmptyTokenExhaustion()` (unit-tested) — empty content + `max_tokens` means the model spent the ENTIRE budget on hidden thinking; retry once with **2× the token budget**. Partial answers are never retried; one retry max. Frequent `warn` retries = raise `LLM_MAX_TOKENS` (16384 recommended for reasoning models; thinking counts toward the limit).
 - Agent-side `SQS_LLM_TIMEOUT_SECONDS` must cover attempt + retry (agent default now 240s — 120s once lost the race by 23s).
 
-### Backend wire format (`LLM_API_FORMAT`, `llm.ts` + `anthropic.ts`)
+### Backend wire format (`LLM_API_FORMAT`, `llm.ts` + `anthropic.ts` + `agent-builder.ts`)
 The flag names the **wire format, not the model vendor**: `openai` (default) is
-`POST /v1/chat/completions` — vLLM, Ollama, SGLang, most gateways — and `anthropic` is
-`POST /v1/messages`. Default preserves every existing deployment.
+`POST /v1/chat/completions` — vLLM, Ollama, SGLang, most gateways — `anthropic` is
+`POST /v1/messages`, and `agent-builder` is the Langflow run endpoint. Default preserves every
+existing deployment.
 
 The asymmetry is the point: **the Anthropic path has no translation layer at all.** The agent's
 wire format already *is* Anthropic's — `ContentBlock` is `{type:"tool_use", id, name, input}` /
@@ -98,6 +99,50 @@ type), `systemPrompt` becomes a top-level `system` parameter rather than a messa
 - **Not forwarded on this path:** `LLM_SEED`, `LLM_REASONING_EFFORT`, `LLM_USE_MAX_COMPLETION_TOKENS`
   — none exist in the Messages API (thinking is a `thinking` budget object), and an unknown
   top-level field is a 400.
+
+### Agent builder as a transport (`LLM_API_FORMAT=agent-builder`, `agent-builder.ts`)
+**Why it exists:** the private LLM has an OpenAI-compatible endpoint, but access to it needs a
+long approval. The agent builder — a self-service Langflow platform in front of the same model —
+needs none, so any employee can stand a flow up today. This format is the stopgap; when approval
+lands, `LLM_API_FORMAT=openai` retires the file. That is the whole migration.
+
+**The flow must stay empty: Chat Input → Model → Chat Output.** Every optional component is a
+bug waiting to happen. Memory duplicates the transcript the worker already resends whole each
+round, so the model sees its history twice and re-issues tools it already ran. A prompt component
+splits the contract across two repos, half of it un-versioned in someone's UI. An output parser
+mangles the Slack mrkdwn and the JSON alike. A tool component would require exposing the MCP
+server to the platform — the one thing this design exists to prevent. `session_id` is therefore
+cosmetic for correctness; we send the Slack `threadId` anyway so the platform's logs join ours.
+
+**The cost:** the Langflow envelope has no `tools` field and no `system` field. Everything is
+flattened into one `input_value` string (system prompt → protocol contract → tool catalog →
+transcript) and a tool request comes back as JSON *inside the answer text*. `toAgentBuilderPrompt`
+and `parseReply` are that translation, and both are pure and unit-tested against bytes the real
+flow returned.
+
+- **Tool catalog is a signature line, not JSON Schema** — `name(a, b?) — description`. ~35 tools,
+  and the payload ceiling has never been probed.
+- **IDs are ours** (`c1..cN`, positional). A recorded probe reused ids across rounds; a collision
+  would mis-route a `tool_result`.
+- **One repair, then one correction, then give up loudly.** A recorded reply lost the opening
+  brace of its 7th tool call. `},"id":` is illegal in a well-formed reply, so the repair is
+  unambiguous. If it still fails, the model gets one correction (a probe confirmed it recovers).
+  If that fails too the raw text is returned as the answer — *not* thrown. A throw would retry the
+  SQS message and DLQ it, losing the investigation silently; this way it reaches Slack as plain
+  text, because `parseRca()` needs two `*bold*` sections and won't dress a JSON blob as an RCA.
+- **Protocol lines that a probe paid for:** cap of four tool calls per reply (seven broke the
+  JSON), "never assert what a tool did not return" (a probe ruled out node pressure it never
+  measured and invented a leader election), and "output nothing after the final line" (a probe
+  appended a debug line that would have gone to Slack verbatim).
+- **Inert on this path:** `LLM_MODEL`, `LLM_MAX_TOKENS` (both live in the flow), and the
+  token-exhaustion retry in `callLLM` (this path never reports `max_tokens`). `usage` is omitted —
+  the envelope reports no token counts, so the agent's usage tracking shows zeros here.
+- **Latency is the open risk:** a recorded full-size RCA took **104 s** for a 3.4 KB payload.
+  Multiply by the agent's tool rounds before promising anyone a fast RCA.
+- **Never probed, and worth probing before heavy use:** the payload size ceiling (largest ever
+  sent was 6 KB; real transcripts reach 20 KB, and silent truncation would build an RCA on half
+  the evidence), and the failure shape for a bad key. `extractText` throws on `error:true` inside
+  a 200 body as insurance against the second one.
 - `cacheReadTokens`/`cacheCreationTokens` are real numbers here; the OpenAI path hardcodes them to 0.
 - `assertApiFormat()` runs at the top of `startWorker()`, so a typo'd format fails the pod at boot
   rather than the first alert of the day — same rule as the agent's backend registry. It is called
@@ -187,9 +232,9 @@ here, like the private LLM). Step 2 shipped the building blocks (no live SQS han
 | `SQS_MAX_MESSAGES` | Max messages per poll batch | `5` |
 | `SQS_MAX_CONCURRENCY` | Max messages processed concurrently | `10` |
 | `SQS_MAX_RECEIVE_COUNT` | Receives before SQS dead-letters a message | `3` |
-| `LLM_API_FORMAT` | Backend wire format: `openai` \| `anthropic` | `openai` |
-| `LLM_BASE_URL` | Private LLM base URL (trailing `/v1` optional for `anthropic`) | required |
-| `LLM_API_KEY` | API key (`none` if not needed) — `Bearer` on openai, `x-api-key` on anthropic | `none` |
+| `LLM_API_FORMAT` | Backend wire format: `openai` \| `anthropic` \| `agent-builder` | `openai` |
+| `LLM_BASE_URL` | Private LLM base URL (trailing `/v1` optional for `anthropic`). On `agent-builder` this is the FULL run endpoint: `https://<host>/api/v1/run/<flow-id>` | required |
+| `LLM_API_KEY` | API key (`none` if not needed) — `Bearer` on openai, `x-api-key` on anthropic and agent-builder | `none` |
 | `LLM_MODEL` | Model name | required |
 | `LLM_MAX_TOKENS` | Max output tokens | `8096` |
 | `LLM_USE_MAX_COMPLETION_TOKENS` | Use `max_completion_tokens` param (openai only) | `false` |
