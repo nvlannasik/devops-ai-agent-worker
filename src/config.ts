@@ -26,11 +26,16 @@ export const config = {
   },
   llm: {
     // Wire format of the backend, NOT the model vendor: "openai" = /v1/chat/completions
-    // (vLLM, Ollama, SGLang, most gateways), "anthropic" = /v1/messages. Default keeps every
+    // (vLLM, Ollama, SGLang, most gateways), "anthropic" = /v1/messages, "agent-builder" =
+    // the self-service Langflow platform in front of the private LLM (see agent-builder.ts).
+    // The last one is the stopgap while the private LLM's own OpenAI endpoint waits on
+    // approval; flipping this env to "openai" is the whole migration. Default keeps every
     // existing deployment on the path it already used. Validated at boot by assertApiFormat().
-    apiFormat: (process.env.LLM_API_FORMAT ?? "openai") as "openai" | "anthropic",
+    apiFormat: (process.env.LLM_API_FORMAT ?? "openai") as "openai" | "anthropic" | "agent-builder",
+    // the /v1 base for openai and anthropic; for agent-builder the FULL run endpoint
+    // (https://<host>/api/v1/run/<flow-id>) — that path has no shared base to derive.
     baseUrl: process.env.LLM_BASE_URL!,
-    // sent as `Authorization: Bearer` (openai) or `x-api-key` (anthropic)
+    // sent as `Authorization: Bearer` (openai) or `x-api-key` (anthropic, agent-builder)
     apiKey: process.env.LLM_API_KEY ?? "none",
     // Optional SOCKS proxy for the LLM API only (e.g. socks5://127.0.0.1:1080). Node's
     // fetch/undici has no SOCKS support and ignores ALL_PROXY, so a tunnel that curl reaches
