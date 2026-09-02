@@ -100,9 +100,9 @@ test("extractText reads the answer out of the Langflow envelope", () => {
   assert.equal(extractText(envelope), "READY");
 });
 
-// P4 was never probed, so we do not know that failures arrive as non-2xx. If one arrives as
-// HTTP 200 with error:true, the text is an error string — posting it would put it in Slack
-// dressed as an RCA.
+// Real failures were measured as non-2xx (see MEMORY_BANK), but the flag is cheap to honour:
+// if one ever arrives as HTTP 200 with error:true, the text is an error string — posting it
+// would put it in Slack dressed as an RCA.
 test("extractText throws when the envelope carries error:true", () => {
   const envelope = {
     outputs: [{ outputs: [{ results: { message: { text: "flow not found", error: true } } }] }],

@@ -120,8 +120,9 @@ transcript) and a tool request comes back as JSON *inside the answer text*. `toA
 and `parseReply` are that translation, and both are pure and unit-tested against bytes the real
 flow returned.
 
-- **Tool catalog is a signature line, not JSON Schema** — `name(a, b?) — description`. ~35 tools,
-  and the payload ceiling has never been probed.
+- **Tool catalog is a signature line, not JSON Schema** — `name(a, b?) — description`. ~35 tools;
+  the ceiling has since been measured at **no truncation through 32 KB**, so the compact form is
+  now a latency and cost choice rather than a safety one.
 - **IDs are ours** (`c1..cN`, positional). A recorded probe reused ids across rounds; a collision
   would mis-route a `tool_result`.
 - **One repair, then one correction, then give up loudly.** A recorded reply lost the opening
@@ -137,12 +138,23 @@ flow returned.
 - **Inert on this path:** `LLM_MODEL`, `LLM_MAX_TOKENS` (both live in the flow), and the
   token-exhaustion retry in `callLLM` (this path never reports `max_tokens`). `usage` is omitted —
   the envelope reports no token counts, so the agent's usage tracking shows zeros here.
-- **Latency is the open risk:** a recorded full-size RCA took **104 s** for a 3.4 KB payload.
-  Multiply by the agent's tool rounds before promising anyone a fast RCA.
-- **Never probed, and worth probing before heavy use:** the payload size ceiling (largest ever
-  sent was 6 KB; real transcripts reach 20 KB, and silent truncation would build an RCA on half
-  the evidence), and the failure shape for a bad key. `extractText` throws on `error:true` inside
-  a 200 body as insurance against the second one.
+- **Latency is the open risk, and it is wide:** a recorded full-size RCA took **104 s** for a
+  3.4 KB payload, while three *concurrent* full-size RCAs returned in **22 s / 24 s / 76 s** — all
+  200, all correctly formatted, no throttling. So the spread is the problem, not the mean: budget
+  for the 104 s case and multiply by the agent's tool rounds before promising anyone a fast RCA.
+- **The three open probes have now been run** (2026-09-02, `docs/examples/a2a/run-gaps.sh` in the
+  agent repo, bodies kept in `~/riset/response-agent-builder/gap-responses/`):
+  - **No payload ceiling through 32 KB.** A canary token at the tail of a 4/8/16/24/32 KB ladder
+    came back verbatim every time, so nothing is silently dropped at the sizes real transcripts
+    reach. This was the one blocker; it is closed.
+  - **The flow has no memory.** Two calls on the *same* `session_id` — store a token, then ask for
+    it — answered `NONE`, and `session_id` echoes back exactly what we send. Concurrent incidents
+    cannot contaminate each other, and the field stays useful as a log join key.
+  - **Failures are non-2xx with a FastAPI `{"detail": ...}` body**, not a 200 carrying prose: a bad
+    key gives `Invalid or missing API key`, an unknown flow id gives `Agent identifier ... not
+    found`. `post()` throws on `!res.ok` before parsing, so neither can reach Slack as an RCA. The
+    `error:true` check in `extractText` was written blind against this case and stays as cheap
+    insurance — it is now belt-and-braces, not the primary guard.
 - `cacheReadTokens`/`cacheCreationTokens` are real numbers here; the OpenAI path hardcodes them to 0.
 - `assertApiFormat()` runs at the top of `startWorker()`, so a typo'd format fails the pod at boot
   rather than the first alert of the day — same rule as the agent's backend registry. It is called
