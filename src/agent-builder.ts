@@ -65,8 +65,9 @@ function toolSignature(tool: ToolDefinition): string {
   const schema = tool.inputSchema as { properties?: Record<string, unknown>; required?: string[] };
   const required = new Set(schema.required ?? []);
   // Full JSON Schema per tool would be the obvious thing to send, but there are ~35 tools and
-  // the payload ceiling was never probed. A signature line carries what the model actually
-  // needs — the arg names and which may be omitted.
+  // a signature line carries what the model actually needs — the arg names and which may be
+  // omitted. The ceiling has since been measured (no truncation through 32 KB), so this is now
+  // a latency and cost choice rather than a safety one; it is not worth expanding.
   const args = Object.keys(schema.properties ?? {}).map((k) => (required.has(k) ? k : `${k}?`));
   return `${tool.name}(${args.join(", ")}) — ${tool.description.replace(/\s+/g, " ").trim()}`;
 }
@@ -150,9 +151,10 @@ export function extractText(data: unknown): string {
   if (!message || typeof message.text !== "string") {
     throw new Error(`Agent builder returned no output: ${JSON.stringify(data).slice(0, 500)}`);
   }
-  // A failure can arrive as HTTP 200 with error:true inside the message — probe P4 was never
-  // run, so we cannot assume a non-2xx status. Unchecked, the error string would be posted to
-  // Slack dressed as an RCA.
+  // Measured 2026-09-02: real failures come back non-2xx with a FastAPI {"detail": ...} body,
+  // which post() rejects before we ever get here. This check stays anyway — it costs one
+  // comparison, and if the platform ever answers 200 with error:true the error string would
+  // otherwise be posted to Slack dressed as an RCA.
   if (message.error === true) {
     throw new Error(`Agent builder flow error: ${message.text.slice(0, 500)}`);
   }
