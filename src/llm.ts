@@ -162,7 +162,12 @@ async function requestOnce(
     usage: {
       inputTokens: response.usage?.prompt_tokens ?? 0,
       outputTokens: response.usage?.completion_tokens ?? 0,
-      cacheReadTokens: 0,
+      // Server-side prefix caching, which OpenAI-compatible providers do without being asked.
+      // Hardcoding 0 reported a number that was wrong rather than absent: the agent's
+      // llm_usage table showed no cache reads at all for a ~21k-token system prompt re-sent
+      // on every call, so nobody could tell whether the caching was working.
+      // Mirrors devops-ai-agent/src/agent/llm/openai-compatible.ts — change one, change both.
+      cacheReadTokens: response.usage?.prompt_tokens_details?.cached_tokens ?? 0,
       cacheCreationTokens: 0,
     },
   };
