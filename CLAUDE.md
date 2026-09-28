@@ -11,7 +11,7 @@ architecture and design decisions.
 - Build: `npm run build` (tsc → `dist/`)
 - Test: `npm test` (`node:test` + tsx, zero extra deps)
 - Dev: `npm run dev`
-- **Node 24 required.** Default shell node is v14 — use `~/.nvm/versions/node/v24.16.0/bin` on the PATH.
+- **Node 24 required.**
 
 ## Conventions
 - TypeScript ESM (NodeNext). Test files `*.test.ts` excluded from the build.
