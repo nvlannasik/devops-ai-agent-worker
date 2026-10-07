@@ -1,28 +1,36 @@
 # LLM Worker
 
-SQS consumer that bridges AI agent requests to a private LLM. Deployed inside the private network — only needs **outbound** access to AWS SQS. No inbound exceptions required.
+SQS consumer that bridges [devops-ai-agent](../devops-ai-agent) requests to a private LLM — and, optionally, to
+GitHub Enterprise for the GitOps PR flow. Deployed inside the private network — only needs **outbound**
+access to AWS SQS. No inbound exceptions required. (Directory `devops-ai-agent-worker`; the service and
+the chart's subchart are `llm-worker` / `devops-llm-worker`.)
 
 ## How It Works
 
 ```
-devops-ai-agent (EKS)
-    ↓ publish {requestId, messages, tools, systemPrompt}
-SQS Request Queue (FIFO)
-    ↓ poll
-llm-worker (Private Network)
-    ↓ POST /v1/chat/completions
-Private LLM
+devops-ai-agent
+    ↓ publish {requestId, messages, tools, systemPrompt, traceId?}
+SQS Request Queue (FIFO)                    SQS GitOps Request Queue (FIFO)   ← optional
+    ↓ poll                                      ↓ poll {op: dry_run | open_pr, helmRelease, changes, ...}
+llm-worker (Private Network) ───────────────────┘
+    ↓ openai: POST /v1/chat/completions  |  anthropic: POST /v1/messages  |  agent-builder: run endpoint
+Private LLM                                 GitHub Enterprise (PR against the GitOps repo)
     ↓
-SQS Response Queue (FIFO)
-    ↓ poll (agent waits for matching requestId)
-devops-ai-agent (EKS)
+SQS Response Queue (FIFO, shared by both flows)
+    ↓ poll (agent routes by requestId)
+devops-ai-agent
 ```
+
+The agent never sends cluster credentials or GitHub credentials anywhere: it holds none for GitHub,
+and its credential-ish identifiers (IPs, hostnames, ARNs, emails) are already masked before a request
+reaches this queue. `traceId` is the agent's Slack thread id — logged here so one grep joins the
+agent log, this log and the Slack thread.
 
 ## Requirements
 
 - Node.js >= 24
 - AWS credentials with SQS permissions (or IRSA on EKS/EC2)
-- Private LLM with OpenAI-compatible API
+- A private LLM speaking the OpenAI or Anthropic Messages API, or an agent-builder (Langflow) run endpoint
 
 ## Setup
 
@@ -36,7 +44,7 @@ npm test                       # unit tests
 
 ## Testing
 
-`npm test` runs `node --import tsx --test 'src/**/*.test.ts'` — Node's built-in test runner (Node >= 24), no extra dependencies. Test files (`*.test.ts`) are excluded from the production build. Current coverage: `parseSqsRequest` (poison-pill / malformed-message validation).
+`npm test` runs `node --import tsx --test 'src/**/*.test.ts'` — Node's built-in test runner (Node >= 24), no extra dependencies. Test files (`*.test.ts`) are excluded from the production build. Covered: request parsing (poison-pill guard), the OpenAI translation (`toOpenAIMessages`, native `tool_calls` — never stringified), the Anthropic and agent-builder paths, the SOCKS proxy (live loopback), and the GitOps flow (message parsing, value resolution in base/overlay, GitHub client, PAT and App auth, drift detection).
 
 ## Reliability
 
@@ -155,7 +163,7 @@ Required IAM permissions (attach to instance role or IRSA):
     "sqs:SendMessage", "sqs:ReceiveMessage", "sqs:DeleteMessage",
     "sqs:GetQueueUrl", "sqs:CreateQueue"
   ],
-  "Resource": "arn:aws:sqs:*:*:llm-*.fifo"
+  "Resource": ["arn:aws:sqs:*:*:llm-*.fifo", "arn:aws:sqs:*:*:gitops-*.fifo"]
 }
 ```
 
@@ -177,10 +185,15 @@ docker run \
 
 ```
 src/
-├── config.ts    # All config from env vars
-├── llm.ts       # LLM caller — optional params, max_tokens/max_completion_tokens switch
-├── logger.ts    # Winston + LOG_LEVEL
-├── sqs.ts       # resolveQueueUrl() with auto-create
-├── types.ts     # SQSRequest, SQSResponse, LLMResponse
-└── worker.ts    # Poll loop, DLQ forwarding, graceful shutdown
+├── config.ts         # All config from env vars
+├── llm.ts            # OpenAI path — toOpenAIMessages() (keep in sync with the agent's copy), max_tokens switch
+├── anthropic.ts      # LLM_API_FORMAT=anthropic — /v1/messages, no translation
+├── agent-builder.ts  # LLM_API_FORMAT=agent-builder — Langflow run endpoint as a transport
+├── socks.ts          # LLM_SOCKS_PROXY — undici fetch over SOCKS
+├── message.ts        # parseSqsRequest() — poison-pill guard
+├── logger.ts         # Winston + LOG_LEVEL
+├── sqs.ts            # resolveQueueUrl() with auto-create
+├── types.ts          # SQSRequest, SQSResponse, LLMResponse
+├── worker.ts         # Poll loop, DLQ forwarding, graceful shutdown
+└── gitops/           # PR flow: message.ts, resolve.ts (find + edit the value), github-client.ts, github-app.ts, handler.ts
 ```

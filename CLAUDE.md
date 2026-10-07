@@ -2,7 +2,8 @@
 
 SQS consumer that bridges `devops-ai-agent` requests to a private LLM. Runs inside the
 private network — **outbound-only** access to AWS SQS, no inbound exceptions. Part of a
-3-repo system: `devops-ai-agent`, `devops-mcp-server`, `llm-worker` (this).
+multi-repo system: `devops-ai-agent`, `devops-mcp-server`, `llm-worker` (this; directory
+`devops-ai-agent-worker`), deployed by the `devops-ai-helm-charts` umbrella chart.
 
 **Read `MEMORY_BANK.md` before changing the SQS flow or message contract** — it holds the
 architecture and design decisions.
