@@ -124,3 +124,19 @@ test("runHistory: no HelmRelease file is a refusal, not an empty history", async
   const r = await runHistory({ requestId: "r", op: "history", helmRelease: { name: "api", namespace: "x" }, since: "2026-10-07T00:00:00Z" }, backend);
   assert.equal(r.ok, false);
 });
+
+test("runHistory: two overlay files naming the same HelmRelease refuse as ambiguous — never merges unrelated workloads", async () => {
+  const calls: string[] = [];
+  const backend = {
+    listCandidateFiles: async () => [
+      { path: "apps/dev/applications/api/release.yaml", content: hrFile("api") },
+      { path: "apps/dev/applications/other-api/release.yaml", content: hrFile("api") },
+    ],
+    listCommits: async (path: string) => { calls.push(path); return []; },
+    fileSha: async () => "", createBranch: async () => {}, putFile: async () => {}, openPr: async () => "",
+  };
+  const r = await runHistory({ requestId: "r", op: "history", helmRelease: { name: "api", namespace: "flux-app" }, since: "2026-10-07T00:00:00Z" }, backend);
+  assert.equal(r.ok, false);
+  assert.match(r.ok ? "" : r.reason, /ambiguous/);
+  assert.equal(calls.length, 0, "listCommits must never be called once the candidate set is ambiguous");
+});

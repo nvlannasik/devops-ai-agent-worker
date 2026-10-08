@@ -122,10 +122,24 @@ export function toCommit(raw: RawCommit, path: string): GitOpsCommit {
 
 const MAX_COMMITS = 10;
 
+// Same wording as resolveGitOpsEdit's ambiguity refusal (resolve.ts) — one matching file is the
+// contract, and isHelmReleaseFile doesn't check namespace (by design: it may be defaulted/
+// omitted in the file), so two files naming the same HelmRelease are indistinguishable here.
+// Checked PER SET (overlay, base) — an overlay/base pair is the intended, expected shape and
+// must still merge; what must never happen is two *unrelated* workloads sharing a name folding
+// into one history.
+function ambiguityRefusal(name: string, matches: RepoFile[]): GitOpsPayload | undefined {
+  if (matches.length <= 1) return undefined;
+  return { ok: false, reason: `ambiguous: ${matches.length} files define a HelmRelease named \`${name}\` (${matches.map((f) => f.path).join(", ")})` };
+}
+
 export async function runHistory(req: GitOpsHistoryRequest, backend: GitOpsBackend): Promise<GitOpsPayload> {
   const basePrefix = req.pathPrefix ? deriveBasePrefix(req.pathPrefix) : undefined;
-  const files = [...(await backend.listCandidateFiles(req.pathPrefix)), ...(basePrefix ? await backend.listCandidateFiles(basePrefix) : [])];
-  const paths = [...new Set(files.filter((f) => isHelmReleaseFile(f.content, req.helmRelease.name)).map((f) => f.path))];
+  const overlayFiles = (await backend.listCandidateFiles(req.pathPrefix)).filter((f) => isHelmReleaseFile(f.content, req.helmRelease.name));
+  const baseFiles = basePrefix ? (await backend.listCandidateFiles(basePrefix)).filter((f) => isHelmReleaseFile(f.content, req.helmRelease.name)) : [];
+  const refusal = ambiguityRefusal(req.helmRelease.name, overlayFiles) ?? ambiguityRefusal(req.helmRelease.name, baseFiles);
+  if (refusal) return refusal;
+  const paths = [...new Set([...overlayFiles, ...baseFiles].map((f) => f.path))];
   if (paths.length === 0) return { ok: false, reason: `no HelmRelease file for \`${req.helmRelease.namespace}/${req.helmRelease.name}\` found in the repo` };
   const bySha = new Map<string, GitOpsCommit>();
   for (const c of (await Promise.all(paths.map((p) => backend.listCommits(p, req.since)))).flat()) {
