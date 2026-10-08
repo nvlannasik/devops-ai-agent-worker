@@ -13,7 +13,7 @@ import { callLLM, assertApiFormat } from "./llm.js";
 import logger, { errDetail } from "./logger.js";
 import type { SQSResponse } from "./types.js";
 import { parseGitOpsRequest, type GitOpsResponse } from "./gitops/message.js";
-import { runGitOps, githubBackend } from "./gitops/handler.js";
+import { runGitOps, runHistory, githubBackend } from "./gitops/handler.js";
 import { GitHubClient } from "./gitops/github-client.js";
 
 const sqs = new SQSClient({
@@ -177,11 +177,12 @@ async function processGitOpsMessage(body: string, receiptHandle: string, queueUr
     await sqs.send(new DeleteMessageCommand({ QueueUrl: queueUrl, ReceiptHandle: receiptHandle }));
     return;
   }
-  logger.info(`GitOps ${req.op} requestId=${req.requestId} (${req.action} ${req.helmRelease.namespace}/${req.helmRelease.name})`);
+  const action = req.op === "history" ? `since=${req.since}` : req.action;
+  logger.info(`GitOps ${req.op} requestId=${req.requestId} (${action} ${req.helmRelease.namespace}/${req.helmRelease.name})`);
 
   let response: GitOpsResponse;
   try {
-    response = { requestId: req.requestId, response: await runGitOps(req, backend) };
+    response = { requestId: req.requestId, response: req.op === "history" ? await runHistory(req, backend) : await runGitOps(req, backend) };
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
     logger.error(`GitOps error requestId=${req.requestId}: ${errDetail(err)}`);

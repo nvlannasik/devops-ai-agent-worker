@@ -6,6 +6,13 @@ import logger from "../logger.js";
 // github.com and GitHub Enterprise via a configurable apiBase. Installation token is cached
 // until ~1 min before expiry.
 
+export interface RawCommit {
+  sha: string;
+  html_url: string;
+  author?: { login?: string } | null;
+  commit: { message: string; author?: { name?: string; date?: string } | null; committer?: { date?: string } | null };
+}
+
 export interface GitHubClientConfig {
   apiUrl: string; // https://api.github.com or https://<ghe-host>/api/v3
   repo: string; // owner/repo
@@ -107,6 +114,12 @@ export class GitHubClient {
       method: "PUT",
       body: JSON.stringify({ message, content: Buffer.from(content, "utf8").toString("base64"), sha, branch }),
     });
+  }
+
+  // Commits on `branch` that touched `path` since `since` — read-only, one page (the caller caps).
+  async listCommits(path: string, branch: string, since: string): Promise<RawCommit[]> {
+    const q = `sha=${encodeURIComponent(branch)}&path=${encodeURIComponent(path)}&since=${encodeURIComponent(since)}&per_page=20`;
+    return (await this.api(`/repos/${this.cfg.repo}/commits?${q}`)) as RawCommit[];
   }
 
   // Open a PR, return its html_url.

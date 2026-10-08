@@ -63,7 +63,7 @@ const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 // A HelmRelease's Git file: `kind: HelmRelease` + a metadata `name:` matching the release.
 // Namespace is intentionally not matched line-based (it may be defaulted/omitted in the
 // file); duplicate names collapse to a refuse below.
-function isHelmReleaseFile(content: string, name: string): boolean {
+export function isHelmReleaseFile(content: string, name: string): boolean {
   if (!/^\s*kind:\s*HelmRelease\s*$/m.test(content)) return false;
   return new RegExp(`^\\s*name:\\s*(["']?)${escapeRe(name)}\\1\\s*$`, "m").test(content);
 }

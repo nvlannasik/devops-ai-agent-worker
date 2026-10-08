@@ -31,6 +31,8 @@ export interface GitOpsRequest {
 export type GitOpsPayload =
   | { ok: true; op: "dry_run"; path: string; valuesKey: string; before: string; after: string; diff: string }
   | { ok: true; op: "open_pr"; path: string; prUrl: string }
+  // read-only: the commits that touched this HelmRelease's files (overlay + base) since `since`.
+  | { ok: true; op: "history"; commits: GitOpsCommit[] }
   // `drift` present = the repo declares this key, but the cluster is running something else
   // (changed outside GitOps). The agent turns that into a Flux reconcile proposal instead of
   // a PR — the repo is the source of truth.
@@ -42,8 +44,19 @@ export interface GitOpsResponse {
   error?: string;
 }
 
+// Read-only: which commits touched this HelmRelease's files since `since`. Feeds the agent's
+// change timeline (and, later, a revert PR). No branch, no write.
+export interface GitOpsHistoryRequest {
+  requestId: string;
+  op: "history";
+  helmRelease: { name: string; namespace: string };
+  pathPrefix?: string;
+  since: string; // ISO
+}
+export interface GitOpsCommit { sha: string; at: string; author: string; message: string; url: string; paths: string[] }
+
 // Parse + validate. null → poison message (drop, never retry). Mirrors parseSqsRequest.
-export function parseGitOpsRequest(body: string): GitOpsRequest | null {
+export function parseGitOpsRequest(body: string): GitOpsRequest | GitOpsHistoryRequest | null {
   let p: unknown;
   try {
     p = JSON.parse(body);
@@ -53,9 +66,14 @@ export function parseGitOpsRequest(body: string): GitOpsRequest | null {
   if (!p || typeof p !== "object") return null;
   const r = p as Record<string, unknown>;
   if (typeof r.requestId !== "string" || !r.requestId) return null;
-  if (r.op !== "dry_run" && r.op !== "open_pr") return null;
   const hr = r.helmRelease as { name?: unknown; namespace?: unknown } | undefined;
   if (!hr || typeof hr.name !== "string" || typeof hr.namespace !== "string") return null;
+  if (r.pathPrefix !== undefined && typeof r.pathPrefix !== "string") return null;
+  if (r.op === "history") {
+    if (typeof r.since !== "string" || Number.isNaN(Date.parse(r.since))) return null;
+    return p as GitOpsHistoryRequest;
+  }
+  if (r.op !== "dry_run" && r.op !== "open_pr") return null;
   if (r.action !== "set_image" && r.action !== "scale" && r.action !== "set_resources") return null;
   if (!Array.isArray(r.changes)) return null;
   return p as GitOpsRequest;

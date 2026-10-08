@@ -1,6 +1,6 @@
-import { resolveGitOpsEdit, deriveBasePrefix, tagOf, type RepoFile, type ChangeSpec, type ResolveResult } from "./resolve.js";
-import { GitHubClient } from "./github-client.js";
-import type { GitOpsRequest, GitOpsPayload } from "./message.js";
+import { resolveGitOpsEdit, deriveBasePrefix, tagOf, isHelmReleaseFile, type RepoFile, type ChangeSpec, type ResolveResult } from "./resolve.js";
+import { GitHubClient, type RawCommit } from "./github-client.js";
+import type { GitOpsRequest, GitOpsHistoryRequest, GitOpsPayload, GitOpsCommit } from "./message.js";
 import logger from "../logger.js";
 
 // GitOps op orchestration (dry_run → diff, open_pr → PR). The GitHub side is behind a
@@ -8,6 +8,7 @@ import logger from "../logger.js";
 
 export interface GitOpsBackend {
   listCandidateFiles(pathPrefix?: string): Promise<RepoFile[]>; // narrowed repo YAML files with content
+  listCommits(path: string, since: string): Promise<GitOpsCommit[]>;
   fileSha(path: string): Promise<string>;
   createBranch(branch: string): Promise<void>;
   putFile(path: string, content: string, sha: string, branch: string, message: string): Promise<void>;
@@ -106,6 +107,37 @@ export async function runGitOps(req: GitOpsRequest, backend: GitOpsBackend): Pro
   return { ok: true, op: "open_pr", path: resolved.path, prUrl };
 }
 
+// The login when GitHub matched the commit to an account, else the name the commit carries.
+// The email is never read: this reaches Slack and the incident row.
+export function toCommit(raw: RawCommit, path: string): GitOpsCommit {
+  return {
+    sha: raw.sha,
+    at: raw.commit.author?.date ?? raw.commit.committer?.date ?? "",
+    author: raw.author?.login ?? raw.commit.author?.name ?? "unknown",
+    message: raw.commit.message.split("\n")[0].slice(0, 120),
+    url: raw.html_url,
+    paths: [path],
+  };
+}
+
+const MAX_COMMITS = 10;
+
+export async function runHistory(req: GitOpsHistoryRequest, backend: GitOpsBackend): Promise<GitOpsPayload> {
+  const basePrefix = req.pathPrefix ? deriveBasePrefix(req.pathPrefix) : undefined;
+  const files = [...(await backend.listCandidateFiles(req.pathPrefix)), ...(basePrefix ? await backend.listCandidateFiles(basePrefix) : [])];
+  const paths = [...new Set(files.filter((f) => isHelmReleaseFile(f.content, req.helmRelease.name)).map((f) => f.path))];
+  if (paths.length === 0) return { ok: false, reason: `no HelmRelease file for \`${req.helmRelease.namespace}/${req.helmRelease.name}\` found in the repo` };
+  const bySha = new Map<string, GitOpsCommit>();
+  for (const c of (await Promise.all(paths.map((p) => backend.listCommits(p, req.since)))).flat()) {
+    const seen = bySha.get(c.sha);
+    if (seen) seen.paths.push(...c.paths.filter((p) => !seen.paths.includes(p)));
+    else bySha.set(c.sha, { ...c, paths: [...c.paths] });
+  }
+  const commits = [...bySha.values()].sort((a, b) => b.at.localeCompare(a.at)).slice(0, MAX_COMMITS);
+  logger.info(`[gitops] history ${req.requestId} ${req.helmRelease.namespace}/${req.helmRelease.name}: ${commits.length} commit(s) over ${paths.length} file(s)`);
+  return { ok: true, op: "history", commits };
+}
+
 // bounded-concurrency map so fetching candidate files can't burst into GitHub's secondary
 // rate limit
 async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
@@ -132,6 +164,7 @@ export function githubBackend(client: GitHubClient, cfg: { branch: string; pathP
       const chosen = releaseLike.length > 0 ? releaseLike : all;
       return mapLimit(chosen, 8, async (path) => ({ path, content: (await client.getFile(path, cfg.branch)).content }));
     },
+    listCommits: async (path, since) => (await client.listCommits(path, cfg.branch, since)).map((raw) => toCommit(raw, path)),
     fileSha: async (path) => (await client.getFile(path, cfg.branch)).sha,
     createBranch: (branch) => client.createBranch(branch, cfg.branch),
     putFile: (path, content, sha, branch, message) => client.putFile(path, content, sha, branch, message),
