@@ -13,7 +13,7 @@ export interface GitOpsBackend {
   listHistoryFiles?(pathPrefix?: string): Promise<RepoFile[]>;
   listCommits(path: string, since: string): Promise<GitOpsCommit[]>;
   commitInfo(sha: string): Promise<{ parent: string; files: string[]; message: string; date: string }>;
-  fileAt(path: string, ref?: string): Promise<string | null>; // ref omitted = the configured branch; null = absent there
+  fileAt(path: string, ref?: string): Promise<{ content: string; sha: string } | null>; // ref omitted = the configured branch; null = absent there
   fileSha(path: string): Promise<string>;
   createBranch(branch: string): Promise<void>;
   putFile(path: string, content: string, sha: string, branch: string, message: string): Promise<void>;
@@ -179,19 +179,25 @@ export async function runRevert(req: GitOpsRevertRequest, backend: GitOpsBackend
     basePrefix ? backend.listCandidateFiles(basePrefix).then(ofName) : Promise.resolve([] as string[]),
     backend.commitInfo(req.sha),
   ]);
+  // info.parent is the commit's FIRST parent — matches `git revert -m 1`: reverting a merge
+  // undoes what the merged branch changed, not what mainline already had.
+  if (!info.parent) return { ok: false, reason: `commit ${short} has no parent (a root commit) — nothing to revert to` };
   const touched = [...new Set([...overlay, ...base])].filter((p) => info.files.includes(p));
   if (touched.length === 0) return { ok: false, reason: `commit ${short} does not touch HelmRelease \`${req.helmRelease.name}\`'s files` };
-  const edits: Array<{ path: string; head: string; parent: string }> = [];
+  const edits: Array<{ path: string; head: string; parent: string; headSha: string }> = [];
   for (const path of touched) {
     const [head, atSha, parent] = await Promise.all([backend.fileAt(path), backend.fileAt(path, req.sha), backend.fileAt(path, info.parent)]);
     if (head === null) return { ok: false, reason: `not a clean revert: ${path} no longer exists` };
-    if (head !== atSha) {
+    if (head.content !== (atSha === null ? null : atSha.content)) {
       const later = (await backend.listCommits(path, info.date)).find((c) => c.sha !== req.sha);
       return { ok: false, reason: `not a clean revert: ${path} changed after ${short}${later ? ` (by ${later.sha.slice(0, 7)})` : ""}` };
     }
     if (parent === null) return { ok: false, reason: `not a clean revert: ${path} was created by ${short} (no file deletes)` };
-    if (parent === head) return { ok: false, reason: `nothing to revert: ${path} already reads as before ${short}` };
-    edits.push({ path, head, parent });
+    if (parent.content === head.content) return { ok: false, reason: `nothing to revert: ${path} already reads as before ${short}` };
+    // keep the HEAD blob sha from THIS check, never re-fetched — a fresh fileSha() at write
+    // time could belong to a commit that landed on the branch between the check and the PUT,
+    // and GitHub's sha precondition would then silently let the PUT overwrite that commit too.
+    edits.push({ path, head: head.content, parent: parent.content, headSha: head.sha });
   }
   const diff = edits.map((e) => unifiedFileDiff(e.path, e.head, e.parent)).join("\n");
   if (req.dryRun) return { ok: true, op: "revert_pr", dryRun: true, paths: edits.map((e) => e.path), diff };
@@ -199,7 +205,7 @@ export async function runRevert(req: GitOpsRevertRequest, backend: GitOpsBackend
   const title = `Revert ${short}: ${info.message.split("\n")[0].slice(0, 80)}`;
   logger.info(`[gitops] revert_pr ${req.requestId}: ${edits.map((e) => e.path).join(", ")} → branch ${branch}`);
   await backend.createBranch(branch);
-  for (const e of edits) await backend.putFile(e.path, e.parent, await backend.fileSha(e.path), branch, title);
+  for (const e of edits) await backend.putFile(e.path, e.parent, e.headSha, branch, title);
   const body = [
     `Reverts ${req.sha} for HelmRelease \`${req.helmRelease.namespace}/${req.helmRelease.name}\`.`,
     req.incident?.summary ? `\nIncident: ${req.incident.summary}` : "",
@@ -275,7 +281,7 @@ export function githubBackend(client: GitHubClient, cfg: { branch: string; pathP
     listCommits: async (path, since) => (await client.listCommits(path, cfg.branch, since)).map((raw) => toCommit(raw, path)),
     commitInfo: (sha) => client.commitInfo(sha),
     fileAt: async (path, ref) => {
-      try { return (await client.getFile(path, ref ?? cfg.branch)).content; }
+      try { return await client.getFile(path, ref ?? cfg.branch); }
       catch (err) { if (/ failed: 404/.test(String(err))) return null; throw err; }
     },
     fileSha: async (path) => (await client.getFile(path, cfg.branch)).sha,

@@ -225,18 +225,26 @@ const HR = (name: string, extra = "") => `apiVersion: helm.toolkit.fluxcd.io/v2\
 const P = "apps/dev/applications/api/release.yaml";
 function revertBackend(files: Record<string, string | null>, info = { parent: "p0", files: [P], message: "bump env\n\nbody", date: "2026-10-09T01:00:00Z" }) {
   const writes: string[] = [];
+  const calls: { putFile?: { path: string; content: string; sha: string; branch: string; message: string } } = {};
   const backend: GitOpsBackend = {
     listCandidateFiles: async (prefix?: string) => (prefix === "apps/base/applications" ? [] : [{ path: P, content: files.HEAD ?? "" }]),
     listHistoryFiles: async () => { throw new Error("revert must never read the history memo"); },
     listCommits: async () => [{ sha: "later99", at: "2026-10-09T02:00:00Z", author: "a", message: "m", url: "u", paths: [] }],
     commitInfo: async () => info,
-    fileAt: async (_path: string, ref?: string) => files[ref ?? "HEAD"] ?? null,
-    fileSha: async () => "blobsha",
+    fileAt: async (_path: string, ref?: string) => {
+      const key = ref ?? "HEAD";
+      const content = files[key];
+      return content == null ? null : { content, sha: `blob-${key}` };
+    },
+    fileSha: async (): Promise<never> => { throw new Error("runRevert must never call fileSha — it already has the HEAD blob sha from fileAt"); },
     createBranch: async (b: string) => { writes.push(`branch ${b}`); },
-    putFile: async (p: string, content: string) => { writes.push(`put ${p} ${content.includes("strict") ? "parent" : "other"}`); },
+    putFile: async (p: string, content: string, sha: string, branch: string, message: string) => {
+      calls.putFile = { path: p, content, sha, branch, message };
+      writes.push(`put ${p} ${content.includes("strict") ? "parent" : "other"}`);
+    },
     openPr: async (title: string) => { writes.push(`pr ${title}`); return "https://gh/pr/7"; },
   };
-  return { backend, writes };
+  return { backend, writes, calls };
 }
 const req = (dryRun: boolean) => ({ requestId: "req12345abc", op: "revert_pr" as const, helmRelease: { name: "api", namespace: "flux-app" }, sha: "abc1234def", pathPrefix: "apps/dev/applications", dryRun });
 
@@ -256,6 +264,13 @@ test("runRevert: the file changed after the commit is not a clean revert, and na
   assert.match((r as { reason: string }).reason, /not a clean revert.*later99/);
 });
 
+test("runRevert: a root commit (no parent) is refused before any file is read", async () => {
+  const { backend } = revertBackend({ HEAD: HR("api") }, { parent: "", files: [P], message: "initial import", date: "2026-10-09T01:00:00Z" });
+  const r = await runRevert(req(true), backend);
+  assert.equal(r.ok, false);
+  assert.match((r as { reason: string }).reason, /no parent \(a root commit\)/);
+});
+
 test("runRevert: a commit that does not touch the HelmRelease's files is refused", async () => {
   const { backend } = revertBackend({ HEAD: HR("api"), abc1234def: HR("api"), p0: HR("api") }, { parent: "p0", files: ["README.md"], message: "docs", date: "2026-10-09T01:00:00Z" });
   assert.match(((await runRevert(req(true), backend)) as { reason: string }).reason, /does not touch HelmRelease/);
@@ -273,4 +288,11 @@ test("runRevert execute: branch, the parent's content, then a PR", async () => {
   const r = await runRevert(req(false), backend);
   assert.ok(r.ok && r.op === "revert_pr" && !r.dryRun && r.prUrl === "https://gh/pr/7");
   assert.deepEqual(writes, ["branch revert/api-abc1234-req12345", `put ${P} parent`, "pr Revert abc1234: bump env"]);
+});
+
+test("runRevert execute: putFile gets the HEAD blob sha that fileAt(path) returned, never a fresh backend.fileSha", async () => {
+  const { backend, calls } = revertBackend({ HEAD: HR("api", "loose"), abc1234def: HR("api", "loose"), p0: HR("api", "strict") });
+  const r = await runRevert(req(false), backend);
+  assert.ok(r.ok);
+  assert.equal(calls.putFile?.sha, "blob-HEAD", "the sha written is the one read at the clean-revert check, not re-fetched later");
 });
