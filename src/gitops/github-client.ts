@@ -122,6 +122,14 @@ export class GitHubClient {
     return (await this.api(`/repos/${this.cfg.repo}/commits?${q}`)) as RawCommit[];
   }
 
+  // One commit's parent, touched paths and message — what a revert needs. Read-only.
+  async commitInfo(sha: string): Promise<{ parent: string; files: string[]; message: string; date: string }> {
+    const c = (await this.api(`/repos/${this.cfg.repo}/commits/${encodeURIComponent(sha)}`)) as {
+      parents: Array<{ sha: string }>; files?: Array<{ filename: string }>; commit: { message: string; committer?: { date?: string } | null };
+    };
+    return { parent: c.parents[0]?.sha ?? "", files: (c.files ?? []).map((f) => f.filename), message: c.commit.message, date: c.commit.committer?.date ?? "" };
+  }
+
   // Open a PR, return its html_url.
   async openPr(title: string, head: string, base: string, body: string): Promise<string> {
     const pr = (await this.api(`/repos/${this.cfg.repo}/pulls`, {

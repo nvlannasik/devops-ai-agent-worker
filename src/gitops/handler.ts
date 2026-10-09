@@ -1,6 +1,6 @@
 import { resolveGitOpsEdit, deriveBasePrefix, tagOf, isHelmReleaseFile, type RepoFile, type ChangeSpec, type ResolveResult } from "./resolve.js";
 import { GitHubClient, type RawCommit } from "./github-client.js";
-import type { GitOpsRequest, GitOpsHistoryRequest, GitOpsPayload, GitOpsCommit } from "./message.js";
+import type { GitOpsRequest, GitOpsHistoryRequest, GitOpsRevertRequest, GitOpsPayload, GitOpsCommit } from "./message.js";
 import logger from "../logger.js";
 
 // GitOps op orchestration (dry_run → diff, open_pr → PR). The GitHub side is behind a
@@ -12,6 +12,8 @@ export interface GitOpsBackend {
   // dry_run/open_pr: those write a file from the content they read.
   listHistoryFiles?(pathPrefix?: string): Promise<RepoFile[]>;
   listCommits(path: string, since: string): Promise<GitOpsCommit[]>;
+  commitInfo(sha: string): Promise<{ parent: string; files: string[]; message: string; date: string }>;
+  fileAt(path: string, ref?: string): Promise<string | null>; // ref omitted = the configured branch; null = absent there
   fileSha(path: string): Promise<string>;
   createBranch(branch: string): Promise<void>;
   putFile(path: string, content: string, sha: string, branch: string, message: string): Promise<void>;
@@ -165,6 +167,62 @@ export async function runHistory(req: GitOpsHistoryRequest, backend: GitOpsBacke
   return { ok: true, op: "history", commits };
 }
 
+// Revert one commit's change to a HelmRelease's files. Clean reverts only: every touched file must
+// read the same at HEAD as at `sha`, or a later commit changed it and restoring `sha^` would undo
+// that one too. Reads fresh — never listHistoryFiles: this writes a file from what it read.
+export async function runRevert(req: GitOpsRevertRequest, backend: GitOpsBackend): Promise<GitOpsPayload> {
+  const short = req.sha.slice(0, 7);
+  const basePrefix = req.pathPrefix ? deriveBasePrefix(req.pathPrefix) : undefined;
+  const ofName = (files: RepoFile[]) => files.filter((f) => isHelmReleaseFile(f.content, req.helmRelease.name)).map((f) => f.path);
+  const [overlay, base, info] = await Promise.all([
+    backend.listCandidateFiles(req.pathPrefix).then(ofName),
+    basePrefix ? backend.listCandidateFiles(basePrefix).then(ofName) : Promise.resolve([] as string[]),
+    backend.commitInfo(req.sha),
+  ]);
+  const touched = [...new Set([...overlay, ...base])].filter((p) => info.files.includes(p));
+  if (touched.length === 0) return { ok: false, reason: `commit ${short} does not touch HelmRelease \`${req.helmRelease.name}\`'s files` };
+  const edits: Array<{ path: string; head: string; parent: string }> = [];
+  for (const path of touched) {
+    const [head, atSha, parent] = await Promise.all([backend.fileAt(path), backend.fileAt(path, req.sha), backend.fileAt(path, info.parent)]);
+    if (head === null) return { ok: false, reason: `not a clean revert: ${path} no longer exists` };
+    if (head !== atSha) {
+      const later = (await backend.listCommits(path, info.date)).find((c) => c.sha !== req.sha);
+      return { ok: false, reason: `not a clean revert: ${path} changed after ${short}${later ? ` (by ${later.sha.slice(0, 7)})` : ""}` };
+    }
+    if (parent === null) return { ok: false, reason: `not a clean revert: ${path} was created by ${short} (no file deletes)` };
+    if (parent === head) return { ok: false, reason: `nothing to revert: ${path} already reads as before ${short}` };
+    edits.push({ path, head, parent });
+  }
+  const diff = edits.map((e) => unifiedFileDiff(e.path, e.head, e.parent)).join("\n");
+  if (req.dryRun) return { ok: true, op: "revert_pr", dryRun: true, paths: edits.map((e) => e.path), diff };
+  const branch = `revert/${slug(req.helmRelease.name)}-${short}-${req.requestId.slice(0, 8)}`;
+  const title = `Revert ${short}: ${info.message.split("\n")[0].slice(0, 80)}`;
+  logger.info(`[gitops] revert_pr ${req.requestId}: ${edits.map((e) => e.path).join(", ")} → branch ${branch}`);
+  await backend.createBranch(branch);
+  for (const e of edits) await backend.putFile(e.path, e.parent, await backend.fileSha(e.path), branch, title);
+  const body = [
+    `Reverts ${req.sha} for HelmRelease \`${req.helmRelease.namespace}/${req.helmRelease.name}\`.`,
+    req.incident?.summary ? `\nIncident: ${req.incident.summary}` : "",
+    req.incident?.threadUrl ? `\nThread: ${req.incident.threadUrl}` : "",
+    "\n\n_Proposed by the **DevOps AI agent** from the incident's change timeline. Review & merge to apply — Flux reconciles the cluster after merge._",
+  ].join("");
+  const prUrl = await backend.openPr(title, branch, body);
+  logger.info(`[gitops] revert PR opened: ${prUrl}`);
+  return { ok: true, op: "revert_pr", dryRun: false, paths: edits.map((e) => e.path), prUrl };
+}
+
+// A whole-file line diff for the card — release files are small, so trimming the common prefix
+// and suffix is enough.
+function unifiedFileDiff(path: string, from: string, to: string): string {
+  const a = from.split("\n");
+  const b = to.split("\n");
+  let s = 0;
+  while (s < a.length && s < b.length && a[s] === b[s]) s++;
+  let e = 0;
+  while (e < a.length - s && e < b.length - s && a[a.length - 1 - e] === b[b.length - 1 - e]) e++;
+  return [`--- a/${path}`, `+++ b/${path}`, `@@ line ${s + 1} @@`, ...a.slice(s, a.length - e).map((l) => `-${l}`), ...b.slice(s, b.length - e).map((l) => `+${l}`)].join("\n");
+}
+
 // bounded-concurrency map so fetching candidate files can't burst into GitHub's secondary
 // rate limit
 async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
@@ -215,6 +273,11 @@ export function githubBackend(client: GitHubClient, cfg: { branch: string; pathP
     listCandidateFiles,
     listHistoryFiles,
     listCommits: async (path, since) => (await client.listCommits(path, cfg.branch, since)).map((raw) => toCommit(raw, path)),
+    commitInfo: (sha) => client.commitInfo(sha),
+    fileAt: async (path, ref) => {
+      try { return (await client.getFile(path, ref ?? cfg.branch)).content; }
+      catch (err) { if (/ failed: 404/.test(String(err))) return null; throw err; }
+    },
     fileSha: async (path) => (await client.getFile(path, cfg.branch)).sha,
     createBranch: (branch) => client.createBranch(branch, cfg.branch),
     putFile: (path, content, sha, branch, message) => client.putFile(path, content, sha, branch, message),

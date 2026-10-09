@@ -33,6 +33,10 @@ export type GitOpsPayload =
   | { ok: true; op: "open_pr"; path: string; prUrl: string }
   // read-only: the commits that touched this HelmRelease's files (overlay + base) since `since`.
   | { ok: true; op: "history"; commits: GitOpsCommit[] }
+  // revert_pr: restores the HelmRelease's files to `sha`'s parent — only when every touched
+  // file reads the same at HEAD as at `sha` (a clean revert).
+  | { ok: true; op: "revert_pr"; dryRun: true; paths: string[]; diff: string }
+  | { ok: true; op: "revert_pr"; dryRun: false; paths: string[]; prUrl: string }
   // `drift` present = the repo declares this key, but the cluster is running something else
   // (changed outside GitOps). The agent turns that into a Flux reconcile proposal instead of
   // a PR — the repo is the source of truth.
@@ -55,8 +59,19 @@ export interface GitOpsHistoryRequest {
 }
 export interface GitOpsCommit { sha: string; at: string; author: string; message: string; url: string; paths: string[] }
 
+// Undo one commit's change to a HelmRelease's files — only when no later commit touched them.
+export interface GitOpsRevertRequest {
+  requestId: string;
+  op: "revert_pr";
+  helmRelease: { name: string; namespace: string };
+  sha: string;
+  pathPrefix?: string;
+  dryRun?: boolean;
+  incident?: { summary?: string; threadUrl?: string };
+}
+
 // Parse + validate. null → poison message (drop, never retry). Mirrors parseSqsRequest.
-export function parseGitOpsRequest(body: string): GitOpsRequest | GitOpsHistoryRequest | null {
+export function parseGitOpsRequest(body: string): GitOpsRequest | GitOpsHistoryRequest | GitOpsRevertRequest | null {
   let p: unknown;
   try {
     p = JSON.parse(body);
@@ -72,6 +87,11 @@ export function parseGitOpsRequest(body: string): GitOpsRequest | GitOpsHistoryR
   if (r.op === "history") {
     if (typeof r.since !== "string" || Number.isNaN(Date.parse(r.since))) return null;
     return p as GitOpsHistoryRequest;
+  }
+  if (r.op === "revert_pr") {
+    if (typeof r.sha !== "string" || !/^[0-9a-f]{7,40}$/.test(r.sha)) return null;
+    if (r.dryRun !== undefined && typeof r.dryRun !== "boolean") return null;
+    return p as GitOpsRevertRequest;
   }
   if (r.op !== "dry_run" && r.op !== "open_pr") return null;
   if (r.action !== "set_image" && r.action !== "scale" && r.action !== "set_resources") return null;

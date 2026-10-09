@@ -32,3 +32,12 @@ test("history needs no action or changes, but does need a parseable `since`", ()
   // the change ops are still strict
   assert.equal(parseGitOpsRequest(JSON.stringify({ requestId: "r", op: "dry_run", helmRelease: { name: "a", namespace: "b" }, since: "2026-10-08T00:00:00Z" })), null);
 });
+
+test("revert_pr needs a hex sha; dryRun is an optional boolean", () => {
+  const base = { requestId: "r", op: "revert_pr", helmRelease: { name: "a", namespace: "b" } };
+  const ok = parseGitOpsRequest(JSON.stringify({ ...base, sha: "abc1234", dryRun: true }));
+  assert.ok(ok && ok.op === "revert_pr" && ok.sha === "abc1234");
+  assert.equal(parseGitOpsRequest(JSON.stringify({ ...base, sha: "HEAD~1" })), null);
+  assert.equal(parseGitOpsRequest(JSON.stringify({ ...base })), null);
+  assert.equal(parseGitOpsRequest(JSON.stringify({ ...base, sha: "abc1234", dryRun: "yes" })), null);
+});

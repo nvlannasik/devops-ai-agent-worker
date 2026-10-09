@@ -109,11 +109,13 @@ only** (not the GitOps GitHub calls) and TLS/SNI to the real API host is preserv
 ### GitOps PR-flow (optional — `DESIGN_gitops_pr_remediation.md`)
 
 The worker doubles as the private-network bridge to **GitHub Enterprise** (reachable only
-from here). When auth + a repo are configured, a second SQS handler serves three ops against
+from here). When auth + a repo are configured, a second SQS handler serves four ops against
 the GitOps repo for a Flux HelmRelease-managed workload: `dry_run` (preview the edit, no
-write), `open_pr` (branch, commit, open a PR), and `history` (read-only — the commits that
+write), `open_pr` (branch, commit, open a PR), `history` (read-only — the commits that
 touched the HelmRelease's files, overlay + base, since a given time; feeds the agent's change
-timeline). Off unless set.
+timeline), and `revert_pr` (restore the HelmRelease's files to a commit's parent — refuses
+unless every touched file still reads the same at HEAD as at that commit, i.e. a clean
+revert; never reads the `history` file memo, since it writes from what it reads). Off unless set.
 
 **Auth: a PAT (simple, recommended for the initial phase) OR a GitHub App.** A PAT
 (`GITHUB_TOKEN`) is used directly and takes precedence; without it the App flow is used.
