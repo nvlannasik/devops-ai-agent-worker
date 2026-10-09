@@ -147,8 +147,9 @@ function ambiguityRefusal(name: string, matches: RepoFile[]): GitOpsPayload | un
 export async function runHistory(req: GitOpsHistoryRequest, backend: GitOpsBackend): Promise<GitOpsPayload> {
   const basePrefix = req.pathPrefix ? deriveBasePrefix(req.pathPrefix) : undefined;
   const list = (prefix?: string) => (backend.listHistoryFiles ?? backend.listCandidateFiles)(prefix);
-  const overlayFiles = (await list(req.pathPrefix)).filter((f) => isHelmReleaseFile(f.content, req.helmRelease.name));
-  const baseFiles = basePrefix ? (await list(basePrefix)).filter((f) => isHelmReleaseFile(f.content, req.helmRelease.name)) : [];
+  // overlay and base in parallel: a cold read of each is ~3-4 s of GitHub calls, and the agent waits 8 s
+  const ofName = (files: RepoFile[]) => files.filter((f) => isHelmReleaseFile(f.content, req.helmRelease.name));
+  const [overlayFiles, baseFiles] = await Promise.all([list(req.pathPrefix).then(ofName), basePrefix ? list(basePrefix).then(ofName) : []]);
   const refusal = ambiguityRefusal(req.helmRelease.name, overlayFiles) ?? ambiguityRefusal(req.helmRelease.name, baseFiles);
   if (refusal) return refusal;
   const paths = [...new Set([...overlayFiles, ...baseFiles].map((f) => f.path))];

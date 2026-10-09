@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { resolveGitOpsEdit, deriveBasePrefix, tagOf, type RepoFile, type ChangeSpec } from "./resolve.js";
+import { resolveGitOpsEdit, deriveBasePrefix, tagOf, type RepoFile, type ChangeSpec, isHelmReleaseFile } from "./resolve.js";
 
 const HR = { name: "ingress-nginx", namespace: "nginx-ingress" };
 
@@ -300,4 +300,28 @@ test("multi-component base-add: component picks which sub-tree to override; unkn
 
   const unknown = resolveGitOpsEdit([overlay], hr, { action: "scale", changes: [{ field: "replicas", from: 1, to: 2 }], component: "sidecar" }, [base]);
   assert.equal(unknown.ok, false); // component not in base → doesn't narrow → still refuses (never guesses)
+});
+
+// Live 2026-10-09: loadgen's release carries `name: "storefront"` deep in its values (the target it
+// drives), and the line-based matcher read that as a second HelmRelease named storefront — so
+// history AND dry_run/open_pr for storefront were refused as "ambiguous". Only metadata.name counts.
+test("isHelmReleaseFile matches metadata.name only, not a nested `name:` in values", () => {
+  const loadgen = [
+    "apiVersion: helm.toolkit.fluxcd.io/v2",
+    "kind: HelmRelease",
+    "metadata:",
+    "  name: loadgen",
+    "  namespace: flux-app",
+    "spec:",
+    "  values:",
+    "    target:",
+    '      name: "storefront"',
+  ].join("\n");
+  assert.equal(isHelmReleaseFile(loadgen, "loadgen"), true);
+  assert.equal(isHelmReleaseFile(loadgen, "storefront"), false);
+  // a multi-document file: the HelmRelease is the second document
+  const multi = `apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: storefront\n---\nkind: HelmRelease\nmetadata:\n  name: "storefront"\n`;
+  assert.equal(isHelmReleaseFile(multi, "storefront"), true);
+  // a ConfigMap named like the release is not the release
+  assert.equal(isHelmReleaseFile("kind: ConfigMap\nmetadata:\n  name: storefront\n", "storefront"), false);
 });

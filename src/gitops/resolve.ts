@@ -1,4 +1,4 @@
-import { parseDocument } from "yaml";
+import { parseAllDocuments, parseDocument } from "yaml";
 
 // GitOps PR-flow resolver (DESIGN_gitops_pr_remediation.md §3). Given the owning HelmRelease
 // + the change context from the MCP GitOps preview, locate the file in the Git repo and edit
@@ -60,12 +60,19 @@ export type ResolveResult =
 
 const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-// A HelmRelease's Git file: `kind: HelmRelease` + a metadata `name:` matching the release.
-// Namespace is intentionally not matched line-based (it may be defaulted/omitted in the
-// file); duplicate names collapse to a refuse below.
+// A HelmRelease's Git file: a document with `kind: HelmRelease` whose `metadata.name` is the
+// release. Parsed, not line-matched: loadgen's release carries `name: "storefront"` deep in its
+// values, and a line match read that as a second HelmRelease named storefront — every history
+// and PR for storefront was then refused as ambiguous (live 2026-10-09). Namespace is
+// intentionally not matched (it may be defaulted/omitted in the file); duplicate names
+// collapse to a refuse below. An unparseable document is not a match.
 export function isHelmReleaseFile(content: string, name: string): boolean {
-  if (!/^\s*kind:\s*HelmRelease\s*$/m.test(content)) return false;
-  return new RegExp(`^\\s*name:\\s*(["']?)${escapeRe(name)}\\1\\s*$`, "m").test(content);
+  if (!/^\s*kind:\s*HelmRelease\s*$/m.test(content)) return false; // cheap pre-filter
+  return parseAllDocuments(content).some((doc) => {
+    if (!("errors" in doc) || doc.errors.length > 0) return false;
+    const o = doc.toJS() as { kind?: unknown; metadata?: { name?: unknown } } | null;
+    return o?.kind === "HelmRelease" && o.metadata?.name === name;
+  });
 }
 
 // image tag = the part after the last ':' with any @digest stripped. null when the ref
