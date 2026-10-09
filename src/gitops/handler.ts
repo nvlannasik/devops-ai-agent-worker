@@ -110,11 +110,19 @@ export async function runGitOps(req: GitOpsRequest, backend: GitOpsBackend): Pro
 // The login when GitHub matched the commit to an account, else the name the commit carries.
 // The email is never read: this reaches Slack and the incident row.
 export function toCommit(raw: RawCommit, path: string): GitOpsCommit {
+  // commit.author.name can itself be an email (no GitHub account to resolve a login from) —
+  // the rule is NEVER an email, so that falls back to "unknown" same as a missing name.
+  const name = raw.author?.login ?? raw.commit.author?.name;
+  const author = !name || name.includes("@") ? "unknown" : name;
   return {
     sha: raw.sha,
-    at: raw.commit.author?.date ?? raw.commit.committer?.date ?? "",
-    author: raw.author?.login ?? raw.commit.author?.name ?? "unknown",
-    message: raw.commit.message.split("\n")[0].slice(0, 120),
+    // Committer date first: a rebase-merged or long-lived PR keeps its original AUTHOR date,
+    // which can fall outside the window GitHub's `since` (committer-date-based) already matched.
+    at: raw.commit.committer?.date ?? raw.commit.author?.date ?? "",
+    author,
+    // Sliced by code point, not UTF-16 code unit — a code-unit slice can cut an astral
+    // character in half and leave a lone surrogate.
+    message: Array.from(raw.commit.message.split("\n")[0]).slice(0, 120).join(""),
     url: raw.html_url,
     paths: [path],
   };

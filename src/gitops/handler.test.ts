@@ -95,6 +95,35 @@ test("toCommit: login first, then the author name — never an email; first line
   assert.equal(toCommit({ ...raw, author: { login: "jdoe" } }, "p").author, "jdoe");
 });
 
+test("toCommit: the 120-char cut is by code point, not UTF-16 code unit — an emoji straddling the cut leaves no lone surrogate", () => {
+  // "a" * 119 + an astral emoji (2 UTF-16 code units: positions 119-120). A code-unit slice(0,120)
+  // keeps only the emoji's leading surrogate; a code-point slice keeps the whole emoji or drops it.
+  const firstLine = "a".repeat(119) + "😀" + "bbbb";
+  const raw = { sha: "abc1234def", html_url: "https://gh/c/abc", author: null, commit: { message: firstLine, author: { name: "Jane", date: "2026-10-08T01:00:00Z" } } };
+  const c = toCommit(raw, "p");
+  const lonePattern = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+  assert.doesNotMatch(c.message, lonePattern);
+});
+
+test("toCommit: the committer date wins over the author date when both are present", () => {
+  const raw = {
+    sha: "abc1234def", html_url: "https://gh/c/abc", author: null,
+    commit: {
+      message: "m",
+      author: { name: "Jane", date: "2026-09-01T00:00:00Z" },
+      committer: { date: "2026-10-08T01:00:00Z" },
+    },
+  };
+  const c = toCommit(raw, "p");
+  assert.equal(c.at, "2026-10-08T01:00:00Z");
+});
+
+test("toCommit: an author.name that is itself an email maps to \"unknown\", never the email — the rule is NEVER an email", () => {
+  const raw = { sha: "abc1234def", html_url: "https://gh/c/abc", author: null, commit: { message: "m", author: { name: "jane@example.com", date: "2026-10-08T01:00:00Z" } } };
+  const c = toCommit(raw, "p");
+  assert.equal(c.author, "unknown");
+});
+
 test("runHistory: overlay + base files of the HelmRelease, deduped by sha, newest first, capped at 10, no writes", async () => {
   const calls: string[] = [];
   const commit = (sha: string, at: string, path: string) => ({ sha, at, author: "a", message: "m", url: `u/${sha}`, paths: [path] });
