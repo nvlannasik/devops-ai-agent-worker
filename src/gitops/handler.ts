@@ -194,13 +194,18 @@ export function githubBackend(client: GitHubClient, cfg: { branch: string; pathP
   // and every release file in both prefixes: 58 GitHub calls in ~10 s, past the agent's 8 s wait,
   // so incident 251 (2026-10-09) read "git history: timeout" while the worker was answering `ok`.
   // The PROMISE is shared, so a burst waits on one fetch; a failure is dropped, not remembered.
-  // ponytail: per-prefix 60 s memo, history only — a commit landing inside those 60 s is still
-  // seen (listCommits is never cached); only a newly added release file waits for the expiry.
+  // Kept 10 min, not 60 s: on 2026-10-09 GitHub answered contents calls in 2-7 s, so even a
+  // shared cold read (14 s) missed the 8 s wait, and alerts minutes apart each paid for one.
+  // History uses these files only to find WHICH files define the HelmRelease — a values edit
+  // does not change that, and commits (listCommits) are never cached, so a commit is always seen.
+  // ponytail: per-prefix 10 min memo, history only — a newly added or moved release file waits
+  // for the expiry (or a worker restart); make it a config knob if layouts start churning.
+  const HISTORY_FILES_TTL_MS = 10 * 60_000;
   const shared = new Map<string, { at: number; files: Promise<RepoFile[]> }>();
   const listHistoryFiles = (pathPrefix?: string): Promise<RepoFile[]> => {
     const key = pathPrefix ?? cfg.pathPrefix;
     const hit = shared.get(key);
-    if (hit && now() - hit.at < 60_000) return hit.files;
+    if (hit && now() - hit.at < HISTORY_FILES_TTL_MS) return hit.files;
     const files = listCandidateFiles(pathPrefix);
     shared.set(key, { at: now(), files });
     files.catch(() => shared.delete(key));

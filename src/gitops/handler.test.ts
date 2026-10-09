@@ -172,7 +172,7 @@ test("runHistory: two overlay files naming the same HelmRelease refuse as ambigu
 
 // Incident 251 (2026-10-09): three parallel history requests each re-listed the tree and every
 // release file — 58 GitHub calls, 9-10 s, past the agent's 8 s wait, so git read "timeout".
-test("githubBackend: history shares one candidate-file read per prefix for 60 s; the PR path never does", async () => {
+test("githubBackend: history shares one candidate-file read per prefix for 10 min; the PR path never does", async () => {
   const calls = { tree: 0, file: 0 };
   const client = {
     listYamlFiles: async () => { calls.tree++; return ["apps/dev/a/release.yaml"]; },
@@ -184,9 +184,12 @@ test("githubBackend: history shares one candidate-file read per prefix for 60 s;
   assert.deepEqual(calls, { tree: 1, file: 1 }, "concurrent history reads share one fetch");
   await backend.listCandidateFiles("apps/dev");
   assert.deepEqual(calls, { tree: 2, file: 2 }, "the PR path writes from what it read, so it always reads fresh");
-  now += 61_000;
+  now += 9 * 60_000;
   await backend.listHistoryFiles!("apps/dev");
-  assert.equal(calls.tree, 3, "expired after 60 s");
+  assert.equal(calls.tree, 2, "still shared 9 min later — alerts minutes apart hit a warm read");
+  now += 2 * 60_000;
+  await backend.listHistoryFiles!("apps/dev");
+  assert.equal(calls.tree, 3, "expired after 10 min");
 });
 
 test("githubBackend: a failed history read is not remembered", async () => {
