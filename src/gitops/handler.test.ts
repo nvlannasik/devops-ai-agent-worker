@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { runGitOps, prTitle, prBody, runHistory, toCommit, type GitOpsBackend } from "./handler.js";
+import { runGitOps, prTitle, prBody, runHistory, toCommit, githubBackend, type GitOpsBackend } from "./handler.js";
 import type { RepoFile } from "./resolve.js";
 import type { GitOpsRequest } from "./message.js";
 
@@ -168,4 +168,47 @@ test("runHistory: two overlay files naming the same HelmRelease refuse as ambigu
   assert.equal(r.ok, false);
   assert.match(r.ok ? "" : r.reason, /ambiguous/);
   assert.equal(calls.length, 0, "listCommits must never be called once the candidate set is ambiguous");
+});
+
+// Incident 251 (2026-10-09): three parallel history requests each re-listed the tree and every
+// release file — 58 GitHub calls, 9-10 s, past the agent's 8 s wait, so git read "timeout".
+test("githubBackend: history shares one candidate-file read per prefix for 60 s; the PR path never does", async () => {
+  const calls = { tree: 0, file: 0 };
+  const client = {
+    listYamlFiles: async () => { calls.tree++; return ["apps/dev/a/release.yaml"]; },
+    getFile: async () => { calls.file++; return { content: "kind: HelmRelease", sha: "s" }; },
+  };
+  let now = 1_000_000;
+  const backend = githubBackend(client as never, { branch: "main", pathPrefix: "" }, () => now);
+  await Promise.all([backend.listHistoryFiles!("apps/dev"), backend.listHistoryFiles!("apps/dev"), backend.listHistoryFiles!("apps/dev")]);
+  assert.deepEqual(calls, { tree: 1, file: 1 }, "concurrent history reads share one fetch");
+  await backend.listCandidateFiles("apps/dev");
+  assert.deepEqual(calls, { tree: 2, file: 2 }, "the PR path writes from what it read, so it always reads fresh");
+  now += 61_000;
+  await backend.listHistoryFiles!("apps/dev");
+  assert.equal(calls.tree, 3, "expired after 60 s");
+});
+
+test("githubBackend: a failed history read is not remembered", async () => {
+  let fail = true;
+  const client = {
+    listYamlFiles: async () => { if (fail) throw new Error("GitHub 502"); return []; },
+    getFile: async () => ({ content: "", sha: "" }),
+  };
+  const backend = githubBackend(client as never, { branch: "main", pathPrefix: "" }, () => 0);
+  await assert.rejects(backend.listHistoryFiles!("p"));
+  fail = false;
+  assert.deepEqual(await backend.listHistoryFiles!("p"), []);
+});
+
+test("runHistory reads through listHistoryFiles when the backend has it", async () => {
+  const seen: string[] = [];
+  const noWrite = async (): Promise<never> => { throw new Error("no writes"); };
+  const backend: GitOpsBackend = {
+    listCandidateFiles: async () => { seen.push("fresh"); return []; },
+    listHistoryFiles: async () => { seen.push("shared"); return []; },
+    listCommits: async () => [], fileSha: noWrite, createBranch: noWrite, putFile: noWrite, openPr: noWrite,
+  };
+  await runHistory({ requestId: "r", op: "history", helmRelease: { name: "api", namespace: "x" }, since: "2026-10-07T00:00:00Z" }, backend);
+  assert.deepEqual(seen, ["shared"]);
 });

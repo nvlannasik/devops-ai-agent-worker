@@ -8,6 +8,9 @@ import logger from "../logger.js";
 
 export interface GitOpsBackend {
   listCandidateFiles(pathPrefix?: string): Promise<RepoFile[]>; // narrowed repo YAML files with content
+  // Same files, read for `history` only and shared across a burst — see githubBackend. Never for
+  // dry_run/open_pr: those write a file from the content they read.
+  listHistoryFiles?(pathPrefix?: string): Promise<RepoFile[]>;
   listCommits(path: string, since: string): Promise<GitOpsCommit[]>;
   fileSha(path: string): Promise<string>;
   createBranch(branch: string): Promise<void>;
@@ -143,8 +146,9 @@ function ambiguityRefusal(name: string, matches: RepoFile[]): GitOpsPayload | un
 
 export async function runHistory(req: GitOpsHistoryRequest, backend: GitOpsBackend): Promise<GitOpsPayload> {
   const basePrefix = req.pathPrefix ? deriveBasePrefix(req.pathPrefix) : undefined;
-  const overlayFiles = (await backend.listCandidateFiles(req.pathPrefix)).filter((f) => isHelmReleaseFile(f.content, req.helmRelease.name));
-  const baseFiles = basePrefix ? (await backend.listCandidateFiles(basePrefix)).filter((f) => isHelmReleaseFile(f.content, req.helmRelease.name)) : [];
+  const list = (prefix?: string) => (backend.listHistoryFiles ?? backend.listCandidateFiles)(prefix);
+  const overlayFiles = (await list(req.pathPrefix)).filter((f) => isHelmReleaseFile(f.content, req.helmRelease.name));
+  const baseFiles = basePrefix ? (await list(basePrefix)).filter((f) => isHelmReleaseFile(f.content, req.helmRelease.name)) : [];
   const refusal = ambiguityRefusal(req.helmRelease.name, overlayFiles) ?? ambiguityRefusal(req.helmRelease.name, baseFiles);
   if (refusal) return refusal;
   const paths = [...new Set([...overlayFiles, ...baseFiles].map((f) => f.path))];
@@ -178,14 +182,32 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promis
 // Real backend over the GitHub REST client. Narrows to release-like YAML files (Flux
 // layouts name them release.yaml / *-helmrelease.yaml); falls back to all YAML if none
 // match. ponytail: heuristic narrowing — broaden or switch to code-search if it misses a layout.
-export function githubBackend(client: GitHubClient, cfg: { branch: string; pathPrefix: string }): GitOpsBackend {
+export function githubBackend(client: GitHubClient, cfg: { branch: string; pathPrefix: string }, now: () => number = Date.now): GitOpsBackend {
+  const listCandidateFiles = async (pathPrefix?: string): Promise<RepoFile[]> => {
+    const all = await client.listYamlFiles(cfg.branch, pathPrefix ?? cfg.pathPrefix);
+    const releaseLike = all.filter((p) => /(^|\/)[^/]*(release|helmrelease)[^/]*\.ya?ml$/i.test(p));
+    const chosen = releaseLike.length > 0 ? releaseLike : all;
+    return mapLimit(chosen, 8, async (path) => ({ path, content: (await client.getFile(path, cfg.branch)).content }));
+  };
+  // One alert asks history for up to 3 HelmReleases at once, and each request re-listed the tree
+  // and every release file in both prefixes: 58 GitHub calls in ~10 s, past the agent's 8 s wait,
+  // so incident 251 (2026-10-09) read "git history: timeout" while the worker was answering `ok`.
+  // The PROMISE is shared, so a burst waits on one fetch; a failure is dropped, not remembered.
+  // ponytail: per-prefix 60 s memo, history only — a commit landing inside those 60 s is still
+  // seen (listCommits is never cached); only a newly added release file waits for the expiry.
+  const shared = new Map<string, { at: number; files: Promise<RepoFile[]> }>();
+  const listHistoryFiles = (pathPrefix?: string): Promise<RepoFile[]> => {
+    const key = pathPrefix ?? cfg.pathPrefix;
+    const hit = shared.get(key);
+    if (hit && now() - hit.at < 60_000) return hit.files;
+    const files = listCandidateFiles(pathPrefix);
+    shared.set(key, { at: now(), files });
+    files.catch(() => shared.delete(key));
+    return files;
+  };
   return {
-    async listCandidateFiles(pathPrefix?: string) {
-      const all = await client.listYamlFiles(cfg.branch, pathPrefix ?? cfg.pathPrefix);
-      const releaseLike = all.filter((p) => /(^|\/)[^/]*(release|helmrelease)[^/]*\.ya?ml$/i.test(p));
-      const chosen = releaseLike.length > 0 ? releaseLike : all;
-      return mapLimit(chosen, 8, async (path) => ({ path, content: (await client.getFile(path, cfg.branch)).content }));
-    },
+    listCandidateFiles,
+    listHistoryFiles,
     listCommits: async (path, since) => (await client.listCommits(path, cfg.branch, since)).map((raw) => toCommit(raw, path)),
     fileSha: async (path) => (await client.getFile(path, cfg.branch)).sha,
     createBranch: (branch) => client.createBranch(branch, cfg.branch),
