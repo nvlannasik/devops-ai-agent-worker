@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { resolveGitOpsEdit, deriveBasePrefix, tagOf, type RepoFile, type ChangeSpec, isHelmReleaseFile } from "./resolve.js";
+import { resolveGitOpsEdit, deriveBasePrefix, tagOf, type RepoFile, type ChangeSpec, isHelmReleaseFile, locateKeys } from "./resolve.js";
 
 const HR = { name: "ingress-nginx", namespace: "nginx-ingress" };
 
@@ -324,4 +324,55 @@ test("isHelmReleaseFile matches metadata.name only, not a nested `name:` in valu
   assert.equal(isHelmReleaseFile(multi, "storefront"), true);
   // a ConfigMap named like the release is not the release
   assert.equal(isHelmReleaseFile("kind: ConfigMap\nmetadata:\n  name: storefront\n", "storefront"), false);
+});
+
+const LOC_OVERLAY = {
+  path: "apps/dev/applications/orders-api/release.yaml",
+  content: [
+    "apiVersion: helm.toolkit.fluxcd.io/v2",
+    "kind: HelmRelease",
+    "metadata:",
+    "  name: orders-api",
+    "spec:",
+    "  values:",
+    "    replicaCount: 2",
+    "    image:",
+    "      repository: ghcr.io/x/orders-api",
+    "      tag: \"1.4.0\"",
+  ].join("\n"),
+};
+const LOC_BASE = {
+  path: "apps/base/applications/orders-api/release.yaml",
+  content: ["apiVersion: helm.toolkit.fluxcd.io/v2", "kind: HelmRelease", "metadata:", "  name: orders-api", "spec:", "  values:", "    resources: {}"].join("\n"),
+};
+
+test("locateKeys: the overlay line holding the running replicas and image tag", () => {
+  const r = locateKeys([LOC_OVERLAY], [LOC_BASE], { name: "orders-api", namespace: "flux-app", current: { image: "ghcr.io/x/orders-api:1.4.0", replicas: 2 } });
+  assert.deepEqual(r.keys.replicas, { path: LOC_OVERLAY.path, line: 7, key: "spec.values.replicaCount", gitValue: "2", drift: false });
+  assert.deepEqual(r.keys.image, { path: LOC_OVERLAY.path, line: 10, key: "spec.values.image.tag", gitValue: "1.4.0", drift: false });
+  assert.deepEqual(r.files, [{ path: LOC_OVERLAY.path, role: "overlay" }, { path: LOC_BASE.path, role: "base" }]);
+  assert.deepEqual(r.notes, []);
+});
+
+test("locateKeys: a declared but different value is drift, with its line", () => {
+  const r = locateKeys([LOC_OVERLAY], [LOC_BASE], { name: "orders-api", namespace: "flux-app", current: { replicas: 5 } });
+  assert.deepEqual(r.keys.replicas, { path: LOC_OVERLAY.path, line: 7, key: "spec.values.replicaCount", gitValue: "2", drift: true });
+});
+
+test("locateKeys: a value only in base is reported at its base line; absent everywhere is a note", () => {
+  const baseWithReplicas = { ...LOC_BASE, content: LOC_BASE.content + "\n    replicaCount: 3" };
+  const overlayNoReplicas = { ...LOC_OVERLAY, content: LOC_OVERLAY.content.replace("    replicaCount: 2\n", "") };
+  const r = locateKeys([overlayNoReplicas], [baseWithReplicas], { name: "orders-api", namespace: "flux-app", current: { replicas: 3 } });
+  assert.equal(r.keys.replicas?.path, LOC_BASE.path);
+  assert.equal(r.keys.replicas?.drift, false);
+  const none = locateKeys([overlayNoReplicas], [LOC_BASE], { name: "orders-api", namespace: "flux-app", current: { replicas: 3 } });
+  assert.equal(none.keys.replicas, undefined);
+  assert.match(none.notes.join("\n"), /replicas.*not declared/);
+});
+
+test("locateKeys: two files defining the HelmRelease is a refusal note, never a guess", () => {
+  const twin = { ...LOC_OVERLAY, path: "apps/dev/applications/orders-api-copy/release.yaml" };
+  const r = locateKeys([LOC_OVERLAY, twin], [], { name: "orders-api", namespace: "flux-app", current: { replicas: 2 } });
+  assert.deepEqual(r.keys, {});
+  assert.match(r.notes.join("\n"), /ambiguous: 2 files/);
 });

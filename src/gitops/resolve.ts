@@ -93,7 +93,7 @@ interface SearchSpec {
 
 // Build the (key, from→to) search specs for an action. null = this action can't be
 // resolved line-based (with a human reason).
-function searchSpecs(spec: ChangeSpec): { specs: SearchSpec[] } | { error: string } {
+export function searchSpecs(spec: ChangeSpec): { specs: SearchSpec[] } | { error: string } {
   if (spec.action === "set_image") {
     const c = spec.changes[0];
     if (!c) return { error: "no image change provided" };
@@ -234,11 +234,11 @@ function findMatches(lines: string[], specs: SearchSpec[]): LineMatch[] {
 // This is what tells "the overlay doesn't set this at all" apart from "the overlay sets it
 // to something else", which are indistinguishable to a value-matching search and were both
 // reported as "not set in the overlay".
-function findKeyLines(lines: string[], keys: string[]): Array<{ key: string; value: string; path: string[] }> {
-  const out: Array<{ key: string; value: string; path: string[] }> = [];
+function findKeyLines(lines: string[], keys: string[]): Array<{ key: string; value: string; path: string[]; lineIdx: number }> {
+  const out: Array<{ key: string; value: string; path: string[]; lineIdx: number }> = [];
   const stack: Array<{ indent: number; key: string }> = [];
   const headerRe = /^(\s*)([\w.\-/]+):\s*(#.*)?$/;
-  lines.forEach((line) => {
+  lines.forEach((line, lineIdx) => {
     if (!line.trim() || line.trimStart().startsWith("#")) return;
     const indent = line.length - line.trimStart().length;
     while (stack.length && stack[stack.length - 1].indent >= indent) stack.pop();
@@ -248,7 +248,7 @@ function findKeyLines(lines: string[], keys: string[]): Array<{ key: string; val
     }
     for (const key of keys) {
       const m = line.match(new RegExp(`^\\s*${escapeRe(key)}:\\s*(["']?)(.*?)\\1\\s*(#.*)?$`));
-      if (m && m[2]) out.push({ key, value: m[2], path: [...stack.map((s) => s.key), key] });
+      if (m && m[2]) out.push({ key, value: m[2], path: [...stack.map((s) => s.key), key], lineIdx });
     }
   });
   return out;
@@ -439,4 +439,63 @@ export function deriveBasePrefix(overlayPrefix: string, baseSegment = "base"): s
   if (parts.length < 2 || parts[1] === baseSegment) return undefined;
   parts[1] = baseSegment;
   return parts.join("/");
+}
+
+// ---- locate (read-only "where would I change this") ----
+
+export interface LocateTarget { name: string; namespace: string; current: { image?: string; replicas?: number }; component?: string }
+export interface GitKey { path: string; line: number; key: string; gitValue: string; drift: boolean }
+export interface LocateResult { name: string; namespace: string; files: Array<{ path: string; role: "overlay" | "base" }>; keys: { image?: GitKey; replicas?: GitKey }; notes: string[] }
+
+// The line holding the RUNNING value (the same search the PR flow edits with, from = to = current),
+// or the declared line when Git says something else (drift). Overlay first, then base. Ambiguity is
+// a note, never a guess — the PR flow refuses the same way.
+function locateIn(file: RepoFile, specs: ReturnType<typeof searchSpecs>, component?: string): GitKey | "ambiguous" | null {
+  if ("error" in specs) return null;
+  const lines = file.content.split("\n");
+  const matches = narrowByComponent(findMatches(lines, specs.specs), component);
+  if (matches.length > 1) return "ambiguous";
+  if (matches.length === 1) {
+    const m = matches[0]!;
+    return { path: file.path, line: m.lineIdx + 1, key: m.path.join("."), gitValue: m.to, drift: false };
+  }
+  for (const spec of specs.specs) {
+    const found = narrowByComponent(findKeyLines(lines, spec.keys), component);
+    if (found.length !== 1) continue;
+    const g = found[0]!;
+    return { path: file.path, line: g.lineIdx + 1, key: g.path.join("."), gitValue: g.value, drift: g.value !== spec.from };
+  }
+  return null;
+}
+
+export function locateKeys(overlay: RepoFile[], base: RepoFile[], t: LocateTarget): LocateResult {
+  const ref = `${t.namespace}/${t.name}`;
+  const out: LocateResult = { name: t.name, namespace: t.namespace, files: [], keys: {}, notes: [] };
+  const o = overlay.filter((f) => isHelmReleaseFile(f.content, t.name));
+  const b = base.filter((f) => isHelmReleaseFile(f.content, t.name));
+  for (const [set, label] of [[o, "overlay"], [b, "base"]] as const) {
+    if (set.length > 1) out.notes.push(`ambiguous: ${set.length} files define a HelmRelease named \`${t.name}\` in ${label} (${set.map((f) => f.path).join(", ")}) — not guessing`);
+  }
+  if (o.length > 1) return out;
+  const oFile = o[0];
+  const bFile = b.length === 1 ? b[0] : undefined;
+  out.files = [...(oFile ? [{ path: oFile.path, role: "overlay" as const }] : []), ...(bFile ? [{ path: bFile.path, role: "base" as const }] : [])];
+  if (!oFile && !bFile) {
+    out.notes.push(`no HelmRelease file for \`${ref}\` found in the repo`);
+    return out;
+  }
+  const wanted: Array<["image" | "replicas", ChangeSpec | null]> = [
+    ["image", t.current.image ? { action: "set_image", changes: [{ field: "image", from: t.current.image, to: t.current.image }] } : null],
+    ["replicas", t.current.replicas !== undefined ? { action: "scale", changes: [{ field: "replicas", from: t.current.replicas, to: t.current.replicas }] } : null],
+  ];
+  for (const [what, spec] of wanted) {
+    if (!spec) continue;
+    const specs = searchSpecs(spec);
+    let hit: GitKey | "ambiguous" | null = oFile ? locateIn(oFile, specs, t.component) : null;
+    if (hit === null && bFile) hit = locateIn(bFile, specs, t.component);
+    if (hit === "ambiguous") out.notes.push(`ambiguous: several lines in \`${ref}\`'s files could hold its ${what} — not guessing`);
+    else if (hit) out.keys[what] = hit;
+    else out.notes.push(`${what} of \`${ref}\` is not declared in the overlay or base — the chart default applies`);
+  }
+  return out;
 }

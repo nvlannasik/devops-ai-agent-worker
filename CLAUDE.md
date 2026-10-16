@@ -28,6 +28,8 @@ architecture and design decisions.
 - **FIFO queues:** `MessageGroupId` / `MessageDeduplicationId` = `requestId`.
 - Talks to the private LLM over an **OpenAI-compatible** API by default; see `LLM_API_FORMAT` above.
 
+- **`locate` is read-only and batched** (onboarding's "where to change it", spec `devops-ai-agent/docs/superpowers/specs/2026-10-16-cluster-onboarding-flow-design.md`): one overlay and one base listing answer every target, read fresh (never the history memo). It returns `{ revision, releases[{ files, keys{ image, replicas }: GitKey, notes }] }` — the line holding the RUNNING value, the same search the PR flow edits with. Ambiguity is a note, never a guess; drift is `drift: true` at the declared line.
+
 ## Working style
 - Chat in Indonesian; keep technical/English terms untranslated. **Docs are written in English.**
 - Don't commit or push unless asked.

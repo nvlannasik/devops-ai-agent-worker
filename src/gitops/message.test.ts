@@ -41,3 +41,11 @@ test("revert_pr needs a hex sha; dryRun is an optional boolean", () => {
   assert.equal(parseGitOpsRequest(JSON.stringify({ ...base })), null);
   assert.equal(parseGitOpsRequest(JSON.stringify({ ...base, sha: "abc1234", dryRun: "yes" })), null);
 });
+
+test("locate: targets parse; malformed targets are poison", () => {
+  const ok = parseGitOpsRequest(JSON.stringify({ requestId: "r1", op: "locate", pathPrefix: "apps/dev/applications", targets: [{ name: "orders-api", namespace: "flux-app", current: { image: "x:1", replicas: 2 } }] }));
+  assert.equal(ok?.op, "locate");
+  assert.equal(parseGitOpsRequest(JSON.stringify({ requestId: "r1", op: "locate", targets: [] })), null);
+  assert.equal(parseGitOpsRequest(JSON.stringify({ requestId: "r1", op: "locate", targets: [{ name: "a" }] })), null);
+  assert.equal(parseGitOpsRequest(JSON.stringify({ requestId: "r1", op: "locate", targets: [{ name: "a", namespace: "b", current: { replicas: "2" } }] })), null);
+});

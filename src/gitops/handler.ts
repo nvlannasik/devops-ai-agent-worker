@@ -1,6 +1,6 @@
-import { resolveGitOpsEdit, deriveBasePrefix, tagOf, isHelmReleaseFile, type RepoFile, type ChangeSpec, type ResolveResult } from "./resolve.js";
+import { resolveGitOpsEdit, deriveBasePrefix, tagOf, isHelmReleaseFile, locateKeys, type RepoFile, type ChangeSpec, type ResolveResult } from "./resolve.js";
 import { GitHubClient, type RawCommit } from "./github-client.js";
-import type { GitOpsRequest, GitOpsHistoryRequest, GitOpsRevertRequest, GitOpsPayload, GitOpsCommit } from "./message.js";
+import type { GitOpsRequest, GitOpsHistoryRequest, GitOpsRevertRequest, GitOpsLocateRequest, GitOpsPayload, GitOpsCommit } from "./message.js";
 import logger from "../logger.js";
 
 // GitOps op orchestration (dry_run → diff, open_pr → PR). The GitHub side is behind a
@@ -18,6 +18,7 @@ export interface GitOpsBackend {
   createBranch(branch: string): Promise<void>;
   putFile(path: string, content: string, sha: string, branch: string, message: string): Promise<void>;
   openPr(title: string, branch: string, body: string): Promise<string>; // → PR html_url
+  headSha?(): Promise<string>; // the configured branch's head commit — what `locate` read
 }
 
 type ResolvedEdit = Extract<ResolveResult, { ok: true }>;
@@ -167,6 +168,23 @@ export async function runHistory(req: GitOpsHistoryRequest, backend: GitOpsBacke
   return { ok: true, op: "history", commits };
 }
 
+// Read-only and batched: every target answered from ONE overlay listing and ONE base listing —
+// a listing is 3-14 s of GitHub calls (see githubBackend), so one per HelmRelease would cost the
+// agent's model build that much each. Fresh, never listHistoryFiles: a stale file is a wrong line.
+// headSha is read first; a commit landing between it and the listing is a race the agent's
+// revision note cannot see — ponytail: read the files at that sha if it ever bites.
+export async function runLocate(req: GitOpsLocateRequest, backend: GitOpsBackend): Promise<GitOpsPayload> {
+  const revision = backend.headSha ? await backend.headSha() : "unknown";
+  const basePrefix = req.pathPrefix ? deriveBasePrefix(req.pathPrefix) : undefined;
+  const [overlay, base] = await Promise.all([
+    backend.listCandidateFiles(req.pathPrefix),
+    basePrefix ? backend.listCandidateFiles(basePrefix) : Promise.resolve([] as RepoFile[]),
+  ]);
+  const releases = req.targets.map((t) => locateKeys(overlay, base, t));
+  logger.info(`[gitops] locate ${req.requestId}: ${releases.length} release(s) at ${revision.slice(0, 7)}`);
+  return { ok: true, op: "locate", revision, releases };
+}
+
 // Revert one commit's change to a HelmRelease's files. Clean reverts only: every touched file must
 // read the same at HEAD as at `sha`, or a later commit changed it and restoring `sha^` would undo
 // that one too. Reads fresh — never listHistoryFiles: this writes a file from what it read.
@@ -288,5 +306,6 @@ export function githubBackend(client: GitHubClient, cfg: { branch: string; pathP
     createBranch: (branch) => client.createBranch(branch, cfg.branch),
     putFile: (path, content, sha, branch, message) => client.putFile(path, content, sha, branch, message),
     openPr: (title, branch, body) => client.openPr(title, branch, cfg.branch, body),
+    headSha: () => client.headSha(cfg.branch),
   };
 }

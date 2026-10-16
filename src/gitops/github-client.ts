@@ -100,6 +100,12 @@ export class GitHubClient {
   }
 
   // Create `newBranch` pointing at the tip of `fromBranch`.
+  /** The branch head's commit sha — what `locate` read, so the agent can compare it with Flux. */
+  async headSha(branch: string): Promise<string> {
+    const ref = (await this.api(`/repos/${this.cfg.repo}/git/ref/heads/${encodeURIComponent(branch)}`)) as { object: { sha: string } };
+    return ref.object.sha;
+  }
+
   async createBranch(newBranch: string, fromBranch: string): Promise<void> {
     const ref = (await this.api(`/repos/${this.cfg.repo}/git/ref/heads/${encodeURIComponent(fromBranch)}`)) as { object: { sha: string } };
     await this.api(`/repos/${this.cfg.repo}/git/refs`, {

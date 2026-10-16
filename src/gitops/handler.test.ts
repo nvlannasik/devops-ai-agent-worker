@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { runGitOps, prTitle, prBody, runHistory, runRevert, toCommit, githubBackend, type GitOpsBackend } from "./handler.js";
+import { runGitOps, prTitle, prBody, runHistory, runRevert, runLocate, toCommit, githubBackend, type GitOpsBackend } from "./handler.js";
 import type { RepoFile } from "./resolve.js";
 import type { GitOpsRequest } from "./message.js";
 
@@ -295,4 +295,43 @@ test("runRevert execute: putFile gets the HEAD blob sha that fileAt(path) return
   const r = await runRevert(req(false), backend);
   assert.ok(r.ok);
   assert.equal(calls.putFile?.sha, "blob-HEAD", "the sha written is the one read at the clean-revert check, not re-fetched later");
+});
+
+const LOC_OVERLAY = {
+  path: "apps/dev/applications/orders-api/release.yaml",
+  content: [
+    "apiVersion: helm.toolkit.fluxcd.io/v2",
+    "kind: HelmRelease",
+    "metadata:",
+    "  name: orders-api",
+    "spec:",
+    "  values:",
+    "    replicaCount: 2",
+    "    image:",
+    "      repository: ghcr.io/x/orders-api",
+    "      tag: \"1.4.0\"",
+  ].join("\n"),
+};
+const LOC_BASE = {
+  path: "apps/base/applications/orders-api/release.yaml",
+  content: ["apiVersion: helm.toolkit.fluxcd.io/v2", "kind: HelmRelease", "metadata:", "  name: orders-api", "spec:", "  values:", "    resources: {}"].join("\n"),
+};
+
+test("runLocate: one listing per prefix answers every target, with the head revision", async () => {
+  let lists = 0;
+  const backend = {
+    ...fakeBackend([]).backend,
+    headSha: async () => "abc1234def5678abc1234def5678abc1234def56",
+    listCandidateFiles: async (p?: string) => { lists++; return p?.includes("base") ? [LOC_BASE] : [LOC_OVERLAY]; },
+  } as GitOpsBackend;
+  const out = await runLocate({ requestId: "r", op: "locate", pathPrefix: "apps/dev/applications", targets: [
+    { name: "orders-api", namespace: "flux-app", current: { replicas: 2 } },
+    { name: "missing", namespace: "flux-app", current: { replicas: 1 } },
+  ] }, backend);
+  assert.equal(out.ok, true);
+  assert.equal((out as any).revision, "abc1234def5678abc1234def5678abc1234def56");
+  assert.equal((out as any).releases.length, 2);
+  assert.equal((out as any).releases[0].keys.replicas.line, 7);
+  assert.match((out as any).releases[1].notes.join("\n"), /no HelmRelease file/);
+  assert.equal(lists, 2, "overlay + base, once each — not once per target");
 });

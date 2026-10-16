@@ -37,6 +37,8 @@ export type GitOpsPayload =
   // file reads the same at HEAD as at `sha` (a clean revert).
   | { ok: true; op: "revert_pr"; dryRun: true; paths: string[]; diff: string }
   | { ok: true; op: "revert_pr"; dryRun: false; paths: string[]; prUrl: string }
+  // locate: read-only — where each HelmRelease's image and replicas live in Git (onboarding).
+  | { ok: true; op: "locate"; revision: string; releases: LocateResultMsg[] }
   // `drift` present = the repo declares this key, but the cluster is running something else
   // (changed outside GitOps). The agent turns that into a Flux reconcile proposal instead of
   // a PR — the repo is the source of truth.
@@ -70,8 +72,25 @@ export interface GitOpsRevertRequest {
   incident?: { summary?: string; threadUrl?: string };
 }
 
+// Read-only and batched: several HelmReleases answered from one listing (onboarding's "where to
+// change it"). `current` is what runs, so the line found is the one holding it.
+export interface GitOpsLocateRequest {
+  requestId: string;
+  op: "locate";
+  targets: Array<{ name: string; namespace: string; current: { image?: string; replicas?: number }; component?: string }>;
+  pathPrefix?: string;
+}
+type GitKeyMsg = { path: string; line: number; key: string; gitValue: string; drift: boolean };
+export interface LocateResultMsg {
+  name: string;
+  namespace: string;
+  files: Array<{ path: string; role: "overlay" | "base" }>;
+  keys: { image?: GitKeyMsg; replicas?: GitKeyMsg };
+  notes: string[];
+}
+
 // Parse + validate. null → poison message (drop, never retry). Mirrors parseSqsRequest.
-export function parseGitOpsRequest(body: string): GitOpsRequest | GitOpsHistoryRequest | GitOpsRevertRequest | null {
+export function parseGitOpsRequest(body: string): GitOpsRequest | GitOpsHistoryRequest | GitOpsRevertRequest | GitOpsLocateRequest | null {
   let p: unknown;
   try {
     p = JSON.parse(body);
@@ -81,6 +100,20 @@ export function parseGitOpsRequest(body: string): GitOpsRequest | GitOpsHistoryR
   if (!p || typeof p !== "object") return null;
   const r = p as Record<string, unknown>;
   if (typeof r.requestId !== "string" || !r.requestId) return null;
+  if (r.op === "locate") {
+    if (r.pathPrefix !== undefined && typeof r.pathPrefix !== "string") return null;
+    const ts = r.targets;
+    if (!Array.isArray(ts) || ts.length === 0 || ts.length > 50) return null;
+    for (const t of ts as Array<Record<string, unknown>>) {
+      if (!t || typeof t.name !== "string" || typeof t.namespace !== "string") return null;
+      const c = t.current as Record<string, unknown> | undefined;
+      if (!c || typeof c !== "object") return null;
+      if (c.image !== undefined && typeof c.image !== "string") return null;
+      if (c.replicas !== undefined && typeof c.replicas !== "number") return null;
+      if (t.component !== undefined && typeof t.component !== "string") return null;
+    }
+    return p as GitOpsLocateRequest;
+  }
   const hr = r.helmRelease as { name?: unknown; namespace?: unknown } | undefined;
   if (!hr || typeof hr.name !== "string" || typeof hr.namespace !== "string") return null;
   if (r.pathPrefix !== undefined && typeof r.pathPrefix !== "string") return null;
