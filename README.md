@@ -11,7 +11,7 @@ the chart's subchart are `llm-worker` / `devops-llm-worker`.)
 devops-ai-agent
     ↓ publish {requestId, messages, tools, systemPrompt, traceId?}
 SQS Request Queue (FIFO)                    SQS GitOps Request Queue (FIFO)   ← optional
-    ↓ poll                                      ↓ poll {op: dry_run | open_pr, helmRelease, changes, ...}
+    ↓ poll                                      ↓ poll {op: dry_run | open_pr | history | revert_pr | locate, ...}
 llm-worker (Private Network) ───────────────────┘
     ↓ openai: POST /v1/chat/completions  |  anthropic: POST /v1/messages  |  agent-builder: run endpoint
 Private LLM                                 GitHub Enterprise (PR against the GitOps repo)
@@ -35,14 +35,12 @@ agent log, this log and the Slack thread.
 ## Setup
 
 ```bash
-cp env.example .env
+cp env.example .env            # every variable: docs/CONFIGURATION.md
 npm install
 npm run dev
 npm run build && npm start
 npm test                       # unit tests
 ```
-
-## Testing
 
 `npm test` runs `node --import tsx --test 'src/**/*.test.ts'` — Node's built-in test runner (Node >= 24), no extra dependencies. Test files (`*.test.ts`) are excluded from the production build. Covered: request parsing (poison-pill guard), the OpenAI translation (`toOpenAIMessages`, native `tool_calls` — never stringified), the Anthropic and agent-builder paths, the SOCKS proxy (live loopback), and the GitOps flow (message parsing, value resolution in base/overlay, GitHub client, PAT and App auth, drift detection).
 
@@ -56,121 +54,13 @@ npm test                       # unit tests
 | RedrivePolicy | Best-effort backstop: SQS dead-letters a message after `SQS_MAX_RECEIVE_COUNT` receives (skipped with a warning if IAM is missing) |
 | Request timeouts | SQS client `connectionTimeout`/`requestTimeout` so a hung call can't freeze the poll loop |
 
-## Configuration
+## Documentation
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `AWS_REGION` | AWS region | `ap-southeast-1` |
-| `SQS_REQUEST_QUEUE_NAME` | FIFO queue for requests | `llm-request.fifo` |
-| `SQS_RESPONSE_QUEUE_NAME` | FIFO queue for responses | `llm-response.fifo` |
-| `SQS_REQUEST_DLQ_NAME` | FIFO dead-letter queue | `llm-request-dlq.fifo` |
-| `SQS_POLL_WAIT_SECONDS` | Long-poll wait (max 20) | `10` |
-| `SQS_MAX_MESSAGES` | Max messages per poll | `5` |
-| `SQS_MAX_CONCURRENCY` | Max messages processed concurrently (poll loop never blocks on a slow LLM call) | `10` |
-| `SQS_VISIBILITY_TIMEOUT_SECONDS` | Request queue visibility timeout — must exceed max LLM inference time | `300` |
-| `SQS_MAX_RECEIVE_COUNT` | Receives before SQS moves a message to the DLQ (RedrivePolicy) | `3` |
-| `LLM_BASE_URL` | Private LLM base URL. On `agent-builder` it is the **full run endpoint**, `https://<host>/api/v1/run/<flow-id>` | required |
-| `LLM_API_FORMAT` | Wire format, not vendor: `openai` (`/v1/chat/completions`), `anthropic` (`/v1/messages`), or `agent-builder` (Langflow run endpoint). The Anthropic path needs no message translation — the agent's blocks already are Anthropic blocks. `LLM_SEED` / `LLM_REASONING_EFFORT` / `LLM_USE_MAX_COMPLETION_TOKENS` are **openai-only** and 400 on `/v1/messages`; on `agent-builder`, `LLM_MODEL` and `LLM_MAX_TOKENS` are inert too — both live in the flow | `openai` |
-| `LLM_API_KEY` | API key (`none` if not needed) — sent as `x-api-key` on `anthropic` and `agent-builder` | `none` |
-| `LLM_SOCKS_PROXY` | Optional SOCKS proxy for the LLM API only, e.g. `socks5://127.0.0.1:1080`. Unset = direct connection. See **SOCKS proxy** below | — |
-| `LLM_MODEL` | Model name | required |
-| `LLM_MAX_TOKENS` | Max output tokens. **Reasoning models:** hidden thinking counts toward this — use `16384`+ so thinking + answer fit | `8096` |
-| `LLM_USE_MAX_COMPLETION_TOKENS` | Use `max_completion_tokens` instead of `max_tokens` | `false` |
-| `LLM_REASONING_EFFORT` | Optional — forwarded as `reasoning_effort` (`low`/`medium`/`high`) to cap hidden thinking tokens. Leave unset if the backend rejects it | — |
-| `LLM_TEMPERATURE` | Optional — omit if model doesn't support it | — |
-| `LLM_TOP_P` | Optional — omit if model doesn't support it | — |
-| `LLM_SEED` | Optional — omit if model doesn't support it | — |
-| `LOG_LEVEL` | `error\|warn\|info\|debug` | `debug` (dev), `info` (prod) |
-| `AWS_ACCESS_KEY_ID` | Local dev only — use IRSA in production | — |
-| `AWS_SECRET_ACCESS_KEY` | Local dev only — use IRSA in production | — |
-
-Queues are **auto-created** if they don't exist (FIFO detected from `.fifo` suffix).
-
-### SOCKS proxy (`LLM_SOCKS_PROXY`)
-
-When the worker's host can only reach the LLM API through a **SOCKS tunnel** (e.g. `ssh -D`
-via a whitelisted jump host), set `LLM_SOCKS_PROXY=socks5://<host>:<port>`. Node's built-in
-`fetch` (undici) has **no SOCKS support** and ignores `ALL_PROXY` — so a tunnel that `curl`
-reaches is invisible to the worker without this. The proxy is scoped to the **LLM client
-only** (not the GitOps GitHub calls) and TLS/SNI to the real API host is preserved (no
-`/etc/hosts` trick needed). Leave it unset once the host is whitelisted — no code change.
-
-> **Running in a container:** `127.0.0.1` inside the container is the container, **not** the
-> host where the SSH tunnel listens. Use one of:
-> - host networking (`--network host` / `hostNetwork: true`) → `socks5://127.0.0.1:1080` works, or
-> - `LLM_SOCKS_PROXY=socks5://host.docker.internal:1080` + (Linux) `--add-host=host.docker.internal:host-gateway`, or
-> - the tunnel bound to the host's LAN IP and `socks5://<host-lan-ip>:1080`.
-
-> Implementation note: uses undici's own `fetch` + `Agent` + `fetch-socks` `socksConnector`
-> (NOT Node's global fetch) — mixing a `fetch-socks` dispatcher with Node's internal undici
-> fails with `UND_ERR_INVALID_ARG onRequestStart` (two undici instances). Covered by a live
-> loopback-SOCKS test.
-
-### GitOps PR-flow (optional — `DESIGN_gitops_pr_remediation.md`)
-
-The worker doubles as the private-network bridge to **GitHub Enterprise** (reachable only
-from here). When auth + a repo are configured, a second SQS handler serves four ops against
-the GitOps repo for a Flux HelmRelease-managed workload: `dry_run` (preview the edit, no
-write), `open_pr` (branch, commit, open a PR), `history` (read-only — the commits that
-touched the HelmRelease's files, overlay + base, since a given time; feeds the agent's change
-timeline), and `revert_pr` (restore the HelmRelease's files to a commit's parent — refuses
-unless every touched file still reads the same at HEAD as at that commit, i.e. a clean
-revert; never reads the `history` file memo, since it writes from what it reads). Off unless set.
-
-**Auth: a PAT (simple, recommended for the initial phase) OR a GitHub App.** A PAT
-(`GITHUB_TOKEN`) is used directly and takes precedence; without it the App flow is used.
-Enabled when either auth + `GITOPS_REPO` are set.
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `GITHUB_API_URL` | GitHub API base — GHE = `https://<host>/api/v3` | `https://api.github.com` |
-| `GITHUB_TOKEN` | **PAT** (fine-grained → repo `contents:write`+`pull_requests:write`, else classic `repo`). Simplest; used directly | — |
-| `GITHUB_APP_ID` | GitHub App id (alternative to a PAT) | — |
-| `GITHUB_APP_INSTALLATION_ID` | App installation id on the GitOps repo | — |
-| `GITHUB_APP_PRIVATE_KEY` | App private key (PEM, inline) | — |
-| `GITHUB_APP_PRIVATE_KEY_FILE` | …or a path to the PEM (mounted secret) — takes precedence | — |
-| `GITOPS_REPO` | `owner/repo` — the ONLY repo the handler may touch | — |
-| `GITOPS_BRANCH` | Base branch for PRs | `main` |
-| `GITOPS_PATH_PREFIX` | Optional search-scope subtree (e.g. `apps/`) | — |
-| `SQS_GITOPS_REQUEST_QUEUE_NAME` | FIFO queue for GitOps requests | `gitops-request.fifo` |
-
-## Reasoning-Model Handling
-
-- `finish_reason: "length"` is surfaced to the agent as `max_tokens` (not disguised as a clean `end_turn`), so truncation is visible in both worker and agent logs.
-- **Auto-retry safeguard:** if a response is cut off by the token limit with **no content at all** (a reasoning model spent the whole budget thinking), the worker retries once with **2× the token budget**. Partial answers are never retried. A `warn` log marks each retry — frequent retries mean `LLM_MAX_TOKENS` is too small.
-- The agent's `SQS_LLM_TIMEOUT_SECONDS` must cover a slow call plus this retry (default there is `240`).
-
-## Common Model Compatibility Issues
-
-| Error | Fix |
-|-------|-----|
-| `'max_tokens' is not supported` | Set `LLM_USE_MAX_COMPLETION_TOKENS=true` |
-| `'top_p' is not supported` | Leave `LLM_TOP_P` unset |
-| `'temperature' is not supported` | Leave `LLM_TEMPERATURE` unset |
-
-## AWS Authentication
-
-Set `AWS_AUTH_MODE` to control how credentials are obtained (read by `entrypoint.sh`):
-
-| `AWS_AUTH_MODE` | Use case | Extra env vars needed |
-|-----------------|----------|-----------------------|
-| `iam-anywhere` (default) | On-premise with X.509 cert | `AWS_TRUST_ANCHOR_ARN`, `AWS_ROLESANYWHERE_PROFILE_ARN`, `AWS_ROLE_ARN`, `CERT_PATH`, `CERT_KEY_PATH` |
-| `irsa` | EKS with IAM Roles for Service Accounts | none |
-| `env` | Local dev / CI | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` |
-| `instance-profile` | EC2 / ECS | none |
-
-## AWS Setup
-
-Required IAM permissions (attach to instance role or IRSA):
-```json
-{
-  "Action": [
-    "sqs:SendMessage", "sqs:ReceiveMessage", "sqs:DeleteMessage",
-    "sqs:GetQueueUrl", "sqs:CreateQueue"
-  ],
-  "Resource": ["arn:aws:sqs:*:*:llm-*.fifo", "arn:aws:sqs:*:*:gitops-*.fifo"]
-}
-```
+| Page | What is in it |
+|---|---|
+| [CONFIGURATION](docs/CONFIGURATION.md) | Every env var (SQS, LLM), the SOCKS proxy, AWS authentication and IAM |
+| [GITOPS](docs/GITOPS.md) | The GitOps PR-flow: its five ops, PAT vs GitHub App auth, its env vars |
+| [MODELS](docs/MODELS.md) | Reasoning-model handling and common model compatibility fixes |
 
 ## Docker
 
@@ -189,6 +79,7 @@ docker run \
 ## File Structure
 
 ```
+index.ts              # Entry: SIGTERM/SIGINT → abort → drain
 src/
 ├── config.ts         # All config from env vars
 ├── llm.ts            # OpenAI path — toOpenAIMessages() (keep in sync with the agent's copy), max_tokens switch

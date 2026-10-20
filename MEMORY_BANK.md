@@ -68,7 +68,7 @@ connects directly and times out (curl works, Node doesn't — classic symptom).
   Unset → plain client, zero behavior change (remove the env once whitelisted).
 - New deps: `undici` (its fetch/Agent) + `fetch-socks` (the socks connector) + `socks`.
 - Container gotcha: `127.0.0.1` in a container ≠ the host running the tunnel — use host
-  networking or `host.docker.internal` (see README).
+  networking or `host.docker.internal` (see docs/CONFIGURATION.md, SOCKS proxy).
 
 ### Reasoning-model handling (`llm.ts`)
 - `finish_reason: "length"` → mapped to `max_tokens` (was disguised as `end_turn`), so truncation is visible end-to-end.
