@@ -33,3 +33,10 @@ architecture and design decisions.
 ## Working style
 - Chat in Indonesian; keep technical/English terms untranslated. **Docs are written in English.**
 - Don't commit or push unless asked.
+
+## Tracing (OpenTelemetry, 2026-10-27)
+- **Started by a preload, never from `index.ts`** (`src/tracing/preload.ts`, `node --import` in the Dockerfile CMD). The worker is ESM: an entry's imports run before its body, so an SDK started there instruments nothing, and even started first an ESM `import * as http` stays unpatched without OTel's import-in-the-middle hook — the preload registers it, then loads the SDK with `await import()`. No `OTEL_EXPORTER_OTLP_ENDPOINT` → nothing registered or loaded; `index.ts` imports only `src/tracing/handle.ts` for the shutdown flush.
+- **Both queues:** each message is handled in a CONSUMER span (`llm request` / `gitops request`, with `gitops.op`) parented on the `traceparent` **message attribute** the agent sets; the receive asks for `traceparent`/`tracestate`. Both SQS body contracts are unchanged. No attribute → a new trace.
+- `UndiciInstrumentation` covers global fetch AND the `undici` package (the LLM and GitHub calls). `UrlQueryRedactor` cuts query strings from URL attributes before export.
+- `src/tracing/` is a copy of the mcp-server's (no shared module across repos — keep them identical where they overlap). `preload.test.ts` needs `npm run build` first.
+- Spec: `devops-ai-agent/docs/superpowers/specs/2026-10-27-otel-tracing-design.md`.

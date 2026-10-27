@@ -5,6 +5,8 @@ import {
   SendMessageCommand,
   ChangeMessageVisibilityCommand,
 } from "@aws-sdk/client-sqs";
+import { trace } from "@opentelemetry/api";
+import { withSqsConsumerSpan } from "./tracing/sqs.js";
 import { randomUUID } from "crypto";
 import { config } from "./config.js";
 import { resolveQueueUrl, ensureRedrivePolicy } from "./sqs.js";
@@ -177,6 +179,7 @@ async function processGitOpsMessage(body: string, receiptHandle: string, queueUr
     await sqs.send(new DeleteMessageCommand({ QueueUrl: queueUrl, ReceiptHandle: receiptHandle }));
     return;
   }
+  trace.getActiveSpan()?.setAttribute("gitops.op", req.op);
   const action =
     req.op === "locate" ? `targets=${req.targets.length}` : req.op === "history" ? `since=${req.since}` : req.op === "revert_pr" ? `sha=${req.sha}` : req.action;
   logger.info(`GitOps ${req.op} requestId=${req.requestId} (${action}${req.op === "locate" ? "" : ` ${req.helmRelease.namespace}/${req.helmRelease.name}`})`);
@@ -211,6 +214,7 @@ async function pollLoop(
   signal: AbortSignal,
   queueUrl: string,
   label: string,
+  spanName: string,
   maxConcurrency: number,
   handle: (body: string, receiptHandle: string) => Promise<void>
 ): Promise<void> {
@@ -228,6 +232,8 @@ async function pollLoop(
           QueueUrl: queueUrl,
           MaxNumberOfMessages: Math.min(config.sqs.maxMessages, maxConcurrency - inFlight.size, 10), // SQS hard cap is 10
           WaitTimeSeconds: config.sqs.pollWaitSeconds,
+          // The agent's trace context rides as message attributes (never the body) — tracing/sqs.ts.
+          MessageAttributeNames: ["traceparent", "tracestate"],
         }),
         { abortSignal: signal }
       );
@@ -236,7 +242,7 @@ async function pollLoop(
 
       logger.debug(`[${label}] received ${messages.length} message(s) (in-flight ${inFlight.size})`);
       for (const msg of messages) {
-        const task = handle(msg.Body!, msg.ReceiptHandle!)
+        const task = withSqsConsumerSpan(spanName, msg.MessageAttributes, () => handle(msg.Body!, msg.ReceiptHandle!))
           .catch((err) => { logger.error(`[${label}] handler failed (message will redeliver): ${errDetail(err)}`); })
           .finally(() => inFlight.delete(task));
         inFlight.add(task);
@@ -261,7 +267,7 @@ export async function startWorker(signal: AbortSignal): Promise<void> {
   const maxConcurrency = config.sqs.maxConcurrency;
 
   const loops: Promise<void>[] = [
-    pollLoop(signal, queues.request, config.sqs.requestQueueName, maxConcurrency, (body, rh) => processMessage(body, rh, queues)),
+    pollLoop(signal, queues.request, config.sqs.requestQueueName, "llm request", maxConcurrency, (body, rh) => processMessage(body, rh, queues)),
   ];
 
   // Second consumer for the GitOps PR-flow (DESIGN_gitops_pr_remediation.md), only when a
@@ -270,7 +276,7 @@ export async function startWorker(signal: AbortSignal): Promise<void> {
     const gitopsQueue = await resolveQueueUrl(sqs, config.gitops.requestQueueName, config.sqs.visibilityTimeoutSeconds);
     logger.info(`GitOps PR-flow enabled — repo ${config.gitops.repo} via ${config.gitops.apiUrl}`);
     const backend = githubBackend(new GitHubClient(config.gitops), { branch: config.gitops.branch, pathPrefix: config.gitops.pathPrefix });
-    loops.push(pollLoop(signal, gitopsQueue, config.gitops.requestQueueName, maxConcurrency, (body, rh) => processGitOpsMessage(body, rh, gitopsQueue, queues.response, backend)));
+    loops.push(pollLoop(signal, gitopsQueue, config.gitops.requestQueueName, "gitops request", maxConcurrency, (body, rh) => processGitOpsMessage(body, rh, gitopsQueue, queues.response, backend)));
   }
 
   await Promise.all(loops);

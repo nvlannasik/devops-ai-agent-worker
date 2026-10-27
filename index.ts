@@ -1,5 +1,6 @@
 import { startWorker } from "./src/worker.js";
 import logger from "./src/logger.js";
+import { activeTracing } from "./src/tracing/handle.js";
 
 const controller = new AbortController();
 
@@ -12,7 +13,8 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 
 startWorker(controller.signal)
-  .then(() => process.exit(0)) // graceful drain finished
+  // graceful drain finished; flush the spans the preload's SDK still holds (no-op when tracing is off)
+  .then(async () => { await activeTracing()?.shutdown(); process.exit(0); })
   .catch((err) => {
     logger.error(`Worker fatal error: ${err}`);
     process.exit(1);

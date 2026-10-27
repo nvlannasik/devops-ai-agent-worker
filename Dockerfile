@@ -52,4 +52,7 @@ COPY --from=builder /app/dist ./dist
 EXPOSE 3000
 
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["node", "dist/index.js"]
+# The preload starts OpenTelemetry before the worker's ESM graph loads (src/tracing/preload.ts); with
+# no OTEL_EXPORTER_OTLP_ENDPOINT it does nothing at all.
+ENV OTEL_SERVICE_NAME=llm-worker
+CMD ["node", "--import", "./dist/src/tracing/preload.js", "dist/index.js"]
