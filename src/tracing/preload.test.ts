@@ -79,3 +79,26 @@ test("an unreachable endpoint costs nothing: the app runs and exits cleanly", as
   assert.equal(code, 0);
   assert.match(out, /APP:ok/);
 });
+
+// The bug class behind the agent's 2026-10-27 crashloop is "some dependency breaks when the loader
+// hook wraps it". This loads the worker's real module graph under the preload.
+test("the worker's own module graph loads under the preload", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "otel-graph-"));
+  const app = join(dir, "graph.mjs");
+  const dist = new URL("../../dist/", import.meta.url);
+  writeFileSync(
+    app,
+    ["src/worker.js"].map((m) => `await import(${JSON.stringify(new URL(m, dist).href)});`).join("\n") + `\nconsole.log("GRAPH:ok");`
+  );
+  const out = await new Promise<{ code: number | null; text: string }>((resolve) => {
+    let text = "";
+    const child = spawn(process.execPath, ["--import", PRELOAD, app], {
+      env: { ...process.env, OTEL_EXPORTER_OTLP_ENDPOINT: "http://127.0.0.1:9" },
+    });
+    child.stdout.on("data", (c) => (text += c));
+    child.stderr.on("data", (c) => (text += c));
+    child.on("exit", (code) => resolve({ code, text }));
+  });
+  assert.equal(out.code, 0, out.text.slice(-800));
+  assert.match(out.text, /GRAPH:ok/);
+});
