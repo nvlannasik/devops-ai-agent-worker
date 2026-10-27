@@ -7,6 +7,7 @@ import {
 } from "@aws-sdk/client-sqs";
 import { trace } from "@opentelemetry/api";
 import { withSqsConsumerSpan } from "./tracing/sqs.js";
+import { untraced } from "./tracing/untraced.js";
 import { randomUUID } from "crypto";
 import { config } from "./config.js";
 import { resolveQueueUrl, ensureRedrivePolicy } from "./sqs.js";
@@ -227,7 +228,9 @@ async function pollLoop(
       continue;
     }
     try {
-      const result = await sqs.send(
+      // The poll itself belongs to no trace (tracing/untraced.ts) — an empty receive every 20s would
+      // otherwise be a trace of its own. Each message's handling gets its consumer span below.
+      const result = await untraced(() => sqs.send(
         new ReceiveMessageCommand({
           QueueUrl: queueUrl,
           MaxNumberOfMessages: Math.min(config.sqs.maxMessages, maxConcurrency - inFlight.size, 10), // SQS hard cap is 10
@@ -236,7 +239,7 @@ async function pollLoop(
           MessageAttributeNames: ["traceparent", "tracestate"],
         }),
         { abortSignal: signal }
-      );
+      ));
       const messages = result.Messages ?? [];
       if (messages.length === 0) continue;
 
