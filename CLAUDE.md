@@ -12,7 +12,7 @@ architecture and design decisions.
 - Build: `npm run build` (tsc → `dist/`)
 - Test: `npm test` (`node:test` + tsx, zero extra deps)
 - Dev: `npm run dev`
-- **Node 24 required.**
+- **Node 26 required.**
 
 ## Conventions
 - TypeScript ESM (NodeNext). Test files `*.test.ts` excluded from the build.

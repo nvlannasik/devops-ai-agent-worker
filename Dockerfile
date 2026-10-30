@@ -1,4 +1,4 @@
-FROM node:24-alpine AS builder
+FROM node:26-alpine AS builder
 
 WORKDIR /app
 
@@ -32,7 +32,7 @@ RUN apk add --no-cache curl && \
       "https://rolesanywhere.amazonaws.com/releases/${SIGNING_HELPER_VERSION}/${ARCH}/Linux/Amzn2023/aws_signing_helper" && \
     chmod +x /aws_signing_helper
 
-FROM node:24-alpine AS runtime
+FROM node:26-alpine AS runtime
 
 RUN apk add --no-cache gcompat openssl
 
