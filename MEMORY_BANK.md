@@ -4,7 +4,7 @@
 SQS consumer service that bridges AI agent requests (from EKS) to a private LLM. Deployed inside the private network — only needs **outbound** access to AWS SQS. No inbound exceptions required.
 
 ## Tech Stack
-- **Runtime:** Node.js >= 24, TypeScript (ESM)
+- **Runtime:** Node.js 26, TypeScript (ESM)
 - **AWS SDK:** `@aws-sdk/client-sqs` v3
 - **LLM:** `openai` SDK (OpenAI-compatible API)
 - **Build:** `tsc` → `dist/`, dev via `tsx watch`
@@ -340,5 +340,5 @@ Default is `iam-anywhere` — **set `AWS_AUTH_MODE=irsa` on EKS, `AWS_AUTH_MODE=
 ## Potential Improvements
 - [ ] SQS visibility timeout should exceed LLM inference time (prevents duplicate processing)
 - [ ] CloudWatch alarm on DLQ message count
-- [ ] Support Anthropic API directly (not just OpenAI-compatible)
+- [x] Support Anthropic API directly — `LLM_API_FORMAT=anthropic` (`/v1/messages`, no translation layer)
 - [ ] Request queue depth → CloudWatch → auto-scale worker replicas

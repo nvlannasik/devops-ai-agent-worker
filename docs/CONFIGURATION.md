@@ -37,6 +37,7 @@ Queues are **auto-created** if they don't exist (FIFO detected from `.fifo` suff
 | `LLM_TOP_P` | Optional — omit if model doesn't support it | — |
 | `LLM_SEED` | Optional — omit if model doesn't support it | — |
 | `LOG_LEVEL` | `error\|warn\|info\|debug` | `debug` (dev), `info` (prod) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OpenTelemetry collector (OTLP/HTTP). Unset = tracing off and the preload does nothing; `OTEL_SERVICE_NAME` / `OTEL_TRACES_SAMPLER` follow the OTel spec. The chart sets it from `global.tracing` | — |
 
 ## SOCKS proxy (`LLM_SOCKS_PROXY`)
 

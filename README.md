@@ -28,7 +28,7 @@ agent log, this log and the Slack thread.
 
 ## Requirements
 
-- Node.js >= 24
+- Node.js 26 (what the images run)
 - AWS credentials with SQS permissions (or IRSA on EKS/EC2)
 - A private LLM speaking the OpenAI or Anthropic Messages API, or an agent-builder (Langflow) run endpoint
 
